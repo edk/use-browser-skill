@@ -16,6 +16,13 @@ export PLAYWRIGHT_MCP_HEADLESS="${PLAYWRIGHT_MCP_HEADLESS:-false}"
 mkdir -p "$PW_SCRATCH_DIR" || die "cannot create scratch dir: $PW_SCRATCH_DIR"
 export PLAYWRIGHT_MCP_OUTPUT_DIR="${PLAYWRIGHT_MCP_OUTPUT_DIR:-$PW_SCRATCH_DIR}"
 
+# Absolute path to this script, so self-invocation survives a cd.
+case "$0" in
+  /*)  SELF="$0" ;;
+  */*) SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")" ;;
+  *)   SELF="$(command -v "$0")" ;;
+esac
+
 session_running() {
   "$PW_BIN" list 2>/dev/null | grep -qE "^[[:space:]]*-?[[:space:]]*${PW_SESSION}:"
 }
@@ -49,6 +56,26 @@ EOF
     "$PW_BIN" kill-all  >/dev/null 2>&1 || true
     rm -rf "$PW_SCRATCH_DIR"
     echo "pw: reset (sessions killed, scratch wiped: $PW_SCRATCH_DIR)"
+    ;;
+  selftest)
+    tmp="$(mktemp -d)"; rc=0
+    (
+      cd "$tmp"
+      "$SELF" open about:blank >/dev/null
+      if [[ -d "$tmp/.playwright-cli" ]]; then
+        echo "FAIL: .playwright-cli created in working directory"; exit 1
+      fi
+    ) || rc=1
+    if [[ $rc -eq 0 ]]; then
+      if "$PW_BIN" list | grep -A3 -E "^[[:space:]]*-?[[:space:]]*${PW_SESSION}:" | grep -q "headed: true"; then :
+      else echo "FAIL: session is not headed"; rc=1; fi
+    fi
+    "$SELF" end >/dev/null 2>&1 || true
+    rm -rf "$tmp"
+    if [[ $rc -eq 0 ]]; then
+      echo "PASS: headed, single session, no repo litter (artifacts -> $PW_SCRATCH_DIR)"
+    fi
+    exit "$rc"
     ;;
   list|close-all|kill-all|install|--version|-V)
     exec "$PW_BIN" "$@"
