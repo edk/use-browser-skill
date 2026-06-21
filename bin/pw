@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# pw — wrapper around playwright-cli (headed, one session, artifacts out of repo).
+# Targets bash 3.2 (macOS default). See SKILL.md.
+set -euo pipefail
+
+PW_BIN="${PW_BIN:-playwright-cli}"
+PW_SESSION="${PW_SESSION:-pw}"
+PW_SCRATCH_DIR="${PW_SCRATCH_DIR:-${TMPDIR:-/tmp}/pw-cli}"
+
+die() { echo "pw: $*" >&2; exit 2; }
+
+command -v "$PW_BIN" >/dev/null 2>&1 || \
+  die "playwright-cli not found on PATH. Install: npm i -g @playwright/cli@latest"
+
+export PLAYWRIGHT_MCP_HEADLESS="${PLAYWRIGHT_MCP_HEADLESS:-false}"
+mkdir -p "$PW_SCRATCH_DIR" || die "cannot create scratch dir: $PW_SCRATCH_DIR"
+export PLAYWRIGHT_MCP_OUTPUT_DIR="${PLAYWRIGHT_MCP_OUTPUT_DIR:-$PW_SCRATCH_DIR}"
+
+cmd="${1:-help}"
+case "$cmd" in
+  *)
+    exec "$PW_BIN" -s="$PW_SESSION" "$@"
+    ;;
+esac
