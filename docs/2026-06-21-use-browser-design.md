@@ -2,13 +2,12 @@
 
 Date: 2026-06-21
 Status: approved design, pre-implementation
-Owner: edk
 
 ## Problem
 
 The upstream `playwright-cli` skill (Microsoft's, shipped with the `@playwright/cli`
-binary) is capable, but when an agent uses it the behavior is often not what I want.
-Two concrete, recurring failures:
+binary) is capable, but when an agent uses it the behavior is often not the desired
+one. Two concrete, recurring failures:
 
 1. Browser lifecycle. The agent spawns new browsers and/or leaves zombie browsers
    running, or closes a browser that should have stayed open. Sessions proliferate.
@@ -21,10 +20,9 @@ env var; this design folds that into the same mechanism so it travels too.
 
 Two constraints beyond the fixes:
 
-- Portable. I run Claude Code on more than one machine; the fix must install cleanly
+- Portable. Claude Code may run on more than one machine; the fix must install cleanly
   on a fresh machine without hand-editing per-machine settings.
-- Shareable. This is not just my problem; I want to be able to hand it to someone
-  else with Claude Code.
+- Shareable. The skill should be easy to hand to anyone else running Claude Code.
 
 ## Goals
 
@@ -181,8 +179,7 @@ In a throwaway cwd:
 - Caller passes their own `PLAYWRIGHT_MCP_*`: respected, wrapper does not override.
 - Scratch dir creation failure: fail loudly, do not fall back to cwd.
 - `~/.local/bin` not on PATH: install prints the fix; absolute path still works.
-- `pw` name collision: verified free on the current machine; install warns if a
-  conflicting `pw` is found.
+- `pw` name collision: install warns if a conflicting `pw` is found.
 
 ## Portability and sharing
 

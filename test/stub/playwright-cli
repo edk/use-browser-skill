@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Test stub for playwright-cli. Records how it was invoked; fakes `list`.
+{
+  echo "ARGV: $*"
+  echo "ENV PLAYWRIGHT_MCP_HEADLESS=${PLAYWRIGHT_MCP_HEADLESS:-}"
+  echo "ENV PLAYWRIGHT_MCP_OUTPUT_DIR=${PLAYWRIGHT_MCP_OUTPUT_DIR:-}"
+} >> "${STUB_RECORD:-/dev/null}"
+case "${1:-}" in
+  --help) echo "stub: playwright-cli help" ;;
+  list)   printf '%b' "${STUB_SESSIONS:-}" ;;
+esac
+exit 0

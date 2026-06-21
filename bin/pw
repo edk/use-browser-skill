@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+# pw — wrapper around playwright-cli (headed, one reusable session, persistent
+# login, artifacts out of repo). Targets bash 3.2 (macOS default). See SKILL.md.
+set -euo pipefail
+
+PW_BIN="${PW_BIN:-playwright-cli}"
+PW_SESSION="${PW_SESSION:-pw}"
+PW_SCRATCH_DIR="${PW_SCRATCH_DIR:-${TMPDIR:-/tmp}/pw-cli}"
+# Persistent on-disk browser profile: log in (and pass 2FA) ONCE and reuse it on
+# every later launch and task. PW_EPHEMERAL=1 opts back into throwaway in-memory.
+PW_EPHEMERAL="${PW_EPHEMERAL:-0}"
+PW_PROFILE_DIR="${PW_PROFILE_DIR:-${HOME}/.cache/pw-cli/profile}"
+
+die() { echo "pw: $*" >&2; exit 2; }
+
+command -v "$PW_BIN" >/dev/null 2>&1 || \
+  die "playwright-cli not found on PATH. Install: npm i -g @playwright/cli@latest"
+
+export PLAYWRIGHT_MCP_HEADLESS="${PLAYWRIGHT_MCP_HEADLESS:-false}"
+mkdir -p "$PW_SCRATCH_DIR" || die "cannot create scratch dir: $PW_SCRATCH_DIR"
+export PLAYWRIGHT_MCP_OUTPUT_DIR="${PLAYWRIGHT_MCP_OUTPUT_DIR:-$PW_SCRATCH_DIR}"
+
+# Absolute path to this script, so self-invocation survives a cd.
+case "$0" in
+  /*)  SELF="$0" ;;
+  */*) SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")" ;;
+  *)   SELF="$(command -v "$0")" ;;
+esac
+
+session_running() {
+  "$PW_BIN" list 2>/dev/null | grep -qE "^[[:space:]]*-?[[:space:]]*${PW_SESSION}:"
+}
+
+# Populate PROFILE_ARGS with the flags that pin a fresh launch to the persistent
+# profile (empty when PW_EPHEMERAL=1). Only call this right before launching.
+profile_launch_args() {
+  PROFILE_ARGS=()
+  [[ "$PW_EPHEMERAL" == "1" ]] && return 0
+  mkdir -p "$PW_PROFILE_DIR" || die "cannot create profile dir: $PW_PROFILE_DIR"
+  PROFILE_ARGS=(--persistent --profile "$PW_PROFILE_DIR")
+}
+
+cmd="${1:-help}"
+case "$cmd" in
+  help|-h|--help)
+    profile_mode="persistent ($PW_PROFILE_DIR)"
+    [[ "$PW_EPHEMERAL" == "1" ]] && profile_mode="ephemeral (in-memory)"
+    cat <<EOF
+pw — browser wrapper (headed; one reusable session '${PW_SESSION}'; artifacts in ${PW_SCRATCH_DIR})
+
+Sessions are REUSED: 'pw open URL' navigates the existing browser instead of
+launching a new one. The browser uses a ${profile_mode} profile, so you log in
+(and pass 2FA) once and it sticks across launches and tasks. Opening a brand-new
+browser should be rare — prefer reusing what is already open.
+
+Wrapper verbs:
+  pw open URL   open (or reuse) the session and navigate
+  pw status     list running sessions
+  pw fresh URL  force a NEW browser (close current, relaunch) — rare; only when needed
+  pw forget     clear the saved login (close + delete the persistent profile)
+  pw end        close the '${PW_SESSION}' session (saved login persists on disk)
+  pw nuke       close-all + kill-all + wipe scratch dir (login profile preserved)
+  pw selftest   verify headed + no repo litter
+  pw help       this help
+
+Env: PW_EPHEMERAL=1 (throwaway in-memory profile), PW_PROFILE_DIR (profile path).
+All other commands pass through to playwright-cli, scoped to '${PW_SESSION}'.
+playwright-cli's own help follows:
+EOF
+    "$PW_BIN" --help || true
+    ;;
+  status)
+    exec "$PW_BIN" list
+    ;;
+  end)
+    exec "$PW_BIN" -s="$PW_SESSION" close
+    ;;
+  fresh)
+    shift
+    "$PW_BIN" -s="$PW_SESSION" close >/dev/null 2>&1 || true
+    profile_launch_args
+    exec "$PW_BIN" -s="$PW_SESSION" open ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"} "$@"
+    ;;
+  forget|logout)
+    "$PW_BIN" -s="$PW_SESSION" close >/dev/null 2>&1 || true
+    rm -rf "$PW_PROFILE_DIR"
+    echo "pw: cleared saved login ($PW_PROFILE_DIR). Next 'pw open' starts logged-out."
+    ;;
+  nuke)
+    "$PW_BIN" close-all >/dev/null 2>&1 || true
+    "$PW_BIN" kill-all  >/dev/null 2>&1 || true
+    rm -rf "$PW_SCRATCH_DIR"
+    echo "pw: reset (sessions killed, scratch wiped: $PW_SCRATCH_DIR; login profile kept: $PW_PROFILE_DIR — 'pw forget' to clear it)"
+    ;;
+  selftest)
+    tmp="$(mktemp -d)"; rc=0
+    export PW_PROFILE_DIR="$tmp/profile"   # don't pollute real ~/.cache during selftest
+    (
+      cd "$tmp"
+      "$SELF" open about:blank >/dev/null
+      if [[ -d "$tmp/.playwright-cli" ]]; then
+        echo "FAIL: .playwright-cli created in working directory"; exit 1
+      fi
+    ) || rc=1
+    if [[ $rc -eq 0 ]]; then
+      if "$PW_BIN" list | awk -v s="$PW_SESSION" '
+            $0 ~ "^[[:space:]]*-[[:space:]]*" s ":" {f=1; next}
+            /^-[[:space:]]/ {f=0}
+            f && /headed: true/ {print "Y"}
+          ' | grep -q Y; then :
+      else echo "FAIL: session is not headed"; rc=1; fi
+    fi
+    "$SELF" end >/dev/null 2>&1 || true
+    rm -rf "$tmp"
+    if [[ $rc -eq 0 ]]; then
+      mode="persistent"; [[ "$PW_EPHEMERAL" == "1" ]] && mode="ephemeral"
+      echo "PASS: headed, single session, $mode login, no repo litter (artifacts -> $PW_SCRATCH_DIR)"
+    fi
+    exit "$rc"
+    ;;
+  list|close-all|kill-all|install|--version|-V)
+    exec "$PW_BIN" "$@"
+    ;;
+  -s=*|-s)
+    exec "$PW_BIN" "$@"
+    ;;
+  open)
+    shift
+    if session_running; then
+      if [[ $# -gt 0 ]]; then
+        exec "$PW_BIN" -s="$PW_SESSION" goto "$@"
+      else
+        echo "pw: session '${PW_SESSION}' already open (reusing). 'pw status' to inspect; 'pw fresh URL' to force a new browser."
+      fi
+    else
+      profile_launch_args
+      exec "$PW_BIN" -s="$PW_SESSION" open ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"} "$@"
+    fi
+    ;;
+  *)
+    exec "$PW_BIN" -s="$PW_SESSION" "$@"
+    ;;
+esac
