@@ -18,6 +18,12 @@ export PLAYWRIGHT_MCP_OUTPUT_DIR="${PLAYWRIGHT_MCP_OUTPUT_DIR:-$PW_SCRATCH_DIR}"
 
 cmd="${1:-help}"
 case "$cmd" in
+  list|close-all|kill-all|install|--version|-V)
+    exec "$PW_BIN" "$@"
+    ;;
+  -s=*|-s)
+    exec "$PW_BIN" "$@"
+    ;;
   *)
     exec "$PW_BIN" -s="$PW_SESSION" "$@"
     ;;
