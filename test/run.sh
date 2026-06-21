@@ -14,11 +14,11 @@ run_pw() {
 }
 
 assert_contains() {
-  if grep -qF "$2" "$1"; then echo "ok: $3"; PASS=$((PASS+1))
+  if grep -qF -- "$2" "$1"; then echo "ok: $3"; PASS=$((PASS+1))
   else echo "FAIL: $3"; echo "  want: $2"; echo "  in:"; sed 's/^/    /' "$1"; FAIL=$((FAIL+1)); fi
 }
 assert_not_contains() {
-  if grep -qF "$2" "$1"; then echo "FAIL: $3"; FAIL=$((FAIL+1))
+  if grep -qF -- "$2" "$1"; then echo "FAIL: $3"; FAIL=$((FAIL+1))
   else echo "ok: $3"; PASS=$((PASS+1)); fi
 }
 assert_rc() {
@@ -31,6 +31,15 @@ run_pw goto http://example.com
 assert_contains "$REC" "ENV PLAYWRIGHT_MCP_HEADLESS=false" "goto: headed default set"
 assert_contains "$REC" "ENV PLAYWRIGHT_MCP_OUTPUT_DIR=" "goto: output dir exported"
 assert_contains "$REC" "goto http://example.com" "goto: command passed through"
+
+# --- Task 2: session injection ---
+run_pw goto http://x
+assert_contains "$REC" "-s=pw goto http://x" "default session injected"
+run_pw -s=other open http://x
+assert_not_contains "$REC" "-s=pw" "caller -s respected"
+assert_contains "$REC" "-s=other open http://x" "caller -s passed through"
+run_pw list
+assert_not_contains "$REC" "-s=pw" "global 'list' not injected"
 
 echo "---- $PASS passed, $FAIL failed ----"
 [[ "$FAIL" -eq 0 ]]
