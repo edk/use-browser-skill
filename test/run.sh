@@ -32,6 +32,16 @@ assert_contains "$REC" "ENV PLAYWRIGHT_MCP_HEADLESS=false" "goto: headed default
 assert_contains "$REC" "ENV PLAYWRIGHT_MCP_OUTPUT_DIR=" "goto: output dir exported"
 assert_contains "$REC" "goto http://example.com" "goto: command passed through"
 
+# --- Task 4: idempotent open ---
+run_pw open http://x
+assert_contains "$REC" "-s=pw open http://x" "open launches when nothing running"
+
+REC="$(mktemp)"
+PATH="$STUB_DIR:$PATH" STUB_RECORD="$REC" STUB_SESSIONS='- pw:\n  - headed: true\n' \
+  PW_SCRATCH_DIR="$(mktemp -d)" "$PW" open http://x >/dev/null 2>&1
+assert_contains "$REC" "-s=pw goto http://x" "open reuses running session via goto"
+assert_not_contains "$REC" "-s=pw open" "open does not relaunch a running session"
+
 # --- Task 3: verbs ---
 run_pw status
 assert_contains "$REC" "ARGV: list" "status -> list"

@@ -16,6 +16,10 @@ export PLAYWRIGHT_MCP_HEADLESS="${PLAYWRIGHT_MCP_HEADLESS:-false}"
 mkdir -p "$PW_SCRATCH_DIR" || die "cannot create scratch dir: $PW_SCRATCH_DIR"
 export PLAYWRIGHT_MCP_OUTPUT_DIR="${PLAYWRIGHT_MCP_OUTPUT_DIR:-$PW_SCRATCH_DIR}"
 
+session_running() {
+  "$PW_BIN" list 2>/dev/null | grep -qE "^[[:space:]]*-?[[:space:]]*${PW_SESSION}:"
+}
+
 cmd="${1:-help}"
 case "$cmd" in
   help|-h|--help)
@@ -51,6 +55,18 @@ EOF
     ;;
   -s=*|-s)
     exec "$PW_BIN" "$@"
+    ;;
+  open)
+    shift
+    if session_running; then
+      if [[ $# -gt 0 ]]; then
+        exec "$PW_BIN" -s="$PW_SESSION" goto "$@"
+      else
+        echo "pw: session '${PW_SESSION}' already open"
+      fi
+    else
+      exec "$PW_BIN" -s="$PW_SESSION" open "$@"
+    fi
     ;;
   *)
     exec "$PW_BIN" -s="$PW_SESSION" "$@"
