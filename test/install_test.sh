@@ -11,8 +11,8 @@ HOME="$SANDBOX" INSTALL_SKIP_BIN_CHECK=1 bash "$REPO/install.sh" >/dev/null 2>&1
 
 ck '[[ "$(readlink "$SANDBOX/.claude/skills/use-browser")" == "$REPO" ]]' "skill symlinked"
 ck '[[ "$(readlink "$SANDBOX/.local/bin/pw")" == "$REPO/bin/pw" ]]' "pw symlinked to PATH dir"
-ck '[[ ! -e "$SANDBOX/.claude/skills/playwright-cli" ]]' "upstream skill moved aside"
-ck 'ls "$SANDBOX"/.claude/skills/playwright-cli.disabled.* >/dev/null 2>&1' "upstream backup exists"
+ck '! ls -d "$SANDBOX"/.claude/skills/playwright-cli* >/dev/null 2>&1' "no playwright-cli* left under skills/"
+ck 'ls -d "$SANDBOX"/.claude/use-browser-disabled/playwright-cli.* >/dev/null 2>&1' "upstream backup exists outside skills/"
 
 # idempotent re-run
 HOME="$SANDBOX" INSTALL_SKIP_BIN_CHECK=1 bash "$REPO/install.sh" >/dev/null 2>&1

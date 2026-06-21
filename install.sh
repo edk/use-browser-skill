@@ -23,12 +23,16 @@ echo "Linking skill and command…"
 link_with_backup "$REPO_DIR" "$SKILL_LINK"
 link_with_backup "$REPO_DIR/bin/pw" "$BIN_LINK"
 
-# Move the upstream standalone skill aside so only use-browser triggers.
+# Move the upstream standalone skill OUT of skills/ so it no longer loads.
+# Renaming within skills/ is not enough — Claude Code scans every subdir there
+# regardless of name, so the disabled copy would still trigger.
 UPSTREAM="${HOME}/.claude/skills/playwright-cli"
 if [[ -e "$UPSTREAM" || -L "$UPSTREAM" ]]; then
   if [[ "$(readlink "$UPSTREAM" 2>/dev/null)" != "$REPO_DIR" ]]; then
-    moved="${UPSTREAM}.disabled.$(date +%s)"
-    echo "  ~ moving upstream playwright-cli skill aside -> $moved"
+    backup_dir="${HOME}/.claude/use-browser-disabled"
+    mkdir -p "$backup_dir"
+    moved="${backup_dir}/playwright-cli.$(date +%s)"
+    echo "  ~ moving upstream playwright-cli skill out of skills/ -> $moved"
     mv "$UPSTREAM" "$moved"
   fi
 fi
