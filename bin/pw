@@ -67,7 +67,11 @@ EOF
       fi
     ) || rc=1
     if [[ $rc -eq 0 ]]; then
-      if "$PW_BIN" list | grep -A3 -E "^[[:space:]]*-?[[:space:]]*${PW_SESSION}:" | grep -q "headed: true"; then :
+      if "$PW_BIN" list | awk -v s="$PW_SESSION" '
+            $0 ~ "^[[:space:]]*-[[:space:]]*" s ":" {f=1; next}
+            /^-[[:space:]]/ {f=0}
+            f && /headed: true/ {print "Y"}
+          ' | grep -q Y; then :
       else echo "FAIL: session is not headed"; rc=1; fi
     fi
     "$SELF" end >/dev/null 2>&1 || true

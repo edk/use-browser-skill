@@ -34,7 +34,7 @@ assert_contains "$REC" "goto http://example.com" "goto: command passed through"
 
 # --- Task 5: selftest happy path (hermetic; stub fakes a headed session) ---
 REC="$(mktemp)"
-PATH="$STUB_DIR:$PATH" STUB_RECORD="$REC" STUB_SESSIONS='- pw:\n  - headed: true\n' \
+PATH="$STUB_DIR:$PATH" STUB_RECORD="$REC" STUB_SESSIONS='### Browsers\n- pw:\n  - status: open\n  - browser-type: chrome\n  - user-data-dir: <in-memory>\n  - headed: true\n' \
   PW_SCRATCH_DIR="$(mktemp -d)" "$PW" selftest >/tmp/pw_st 2>&1
 if [[ "$?" -eq 0 ]] && grep -q "PASS:" /tmp/pw_st; then echo "ok: selftest happy path exits 0/PASS"; PASS=$((PASS+1))
 else echo "FAIL: selftest happy path"; sed 's/^/    /' /tmp/pw_st; FAIL=$((FAIL+1)); fi
@@ -44,7 +44,7 @@ run_pw open http://x
 assert_contains "$REC" "-s=pw open http://x" "open launches when nothing running"
 
 REC="$(mktemp)"
-PATH="$STUB_DIR:$PATH" STUB_RECORD="$REC" STUB_SESSIONS='- pw:\n  - headed: true\n' \
+PATH="$STUB_DIR:$PATH" STUB_RECORD="$REC" STUB_SESSIONS='### Browsers\n- pw:\n  - status: open\n  - browser-type: chrome\n  - user-data-dir: <in-memory>\n  - headed: true\n' \
   PW_SCRATCH_DIR="$(mktemp -d)" "$PW" open http://x >/dev/null 2>&1
 assert_contains "$REC" "-s=pw goto http://x" "open reuses running session via goto"
 assert_not_contains "$REC" "-s=pw open" "open does not relaunch a running session"
