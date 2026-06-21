@@ -32,6 +32,19 @@ assert_contains "$REC" "ENV PLAYWRIGHT_MCP_HEADLESS=false" "goto: headed default
 assert_contains "$REC" "ENV PLAYWRIGHT_MCP_OUTPUT_DIR=" "goto: output dir exported"
 assert_contains "$REC" "goto http://example.com" "goto: command passed through"
 
+# --- Task 3: verbs ---
+run_pw status
+assert_contains "$REC" "ARGV: list" "status -> list"
+run_pw end
+assert_contains "$REC" "-s=pw close" "end -> close session"
+
+NUKE_SCRATCH="$(mktemp -d)"; touch "$NUKE_SCRATCH/artifact.yml"
+REC="$(mktemp)"
+PATH="$STUB_DIR:$PATH" STUB_RECORD="$REC" PW_SCRATCH_DIR="$NUKE_SCRATCH" "$PW" nuke >/dev/null 2>&1
+assert_contains "$REC" "ARGV: close-all" "nuke -> close-all"
+assert_contains "$REC" "ARGV: kill-all" "nuke -> kill-all"
+if [[ -d "$NUKE_SCRATCH" ]]; then echo "FAIL: nuke left scratch dir"; FAIL=$((FAIL+1)); else echo "ok: nuke wiped scratch"; PASS=$((PASS+1)); fi
+
 # --- Task 2: session injection ---
 run_pw goto http://x
 assert_contains "$REC" "-s=pw goto http://x" "default session injected"

@@ -18,6 +18,34 @@ export PLAYWRIGHT_MCP_OUTPUT_DIR="${PLAYWRIGHT_MCP_OUTPUT_DIR:-$PW_SCRATCH_DIR}"
 
 cmd="${1:-help}"
 case "$cmd" in
+  help|-h|--help)
+    cat <<EOF
+pw — browser wrapper (headed; one session '${PW_SESSION}'; artifacts in ${PW_SCRATCH_DIR})
+
+Wrapper verbs:
+  pw status     list running sessions
+  pw end        close the '${PW_SESSION}' session
+  pw nuke       close-all + kill-all + wipe scratch dir
+  pw selftest   verify headed + no repo litter
+  pw help       this help
+
+All other commands pass through to playwright-cli, scoped to '${PW_SESSION}'.
+playwright-cli's own help follows:
+EOF
+    "$PW_BIN" --help || true
+    ;;
+  status)
+    exec "$PW_BIN" list
+    ;;
+  end)
+    exec "$PW_BIN" -s="$PW_SESSION" close
+    ;;
+  nuke)
+    "$PW_BIN" close-all >/dev/null 2>&1 || true
+    "$PW_BIN" kill-all  >/dev/null 2>&1 || true
+    rm -rf "$PW_SCRATCH_DIR"
+    echo "pw: reset (sessions killed, scratch wiped: $PW_SCRATCH_DIR)"
+    ;;
   list|close-all|kill-all|install|--version|-V)
     exec "$PW_BIN" "$@"
     ;;
