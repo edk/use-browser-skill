@@ -52,6 +52,25 @@ profile_launch_args() {
   PROFILE_ARGS=()
   [[ "$PW_EPHEMERAL" == "1" ]] && return 0
   mkdir -p "$PW_PROFILE_DIR" || die "cannot create profile dir: $PW_PROFILE_DIR"
+  # Playwright teardown kills Chrome before it writes its clean-exit marker, so
+  # every relaunch of the persistent profile shows the "Restore pages?" crash
+  # bubble (and a stray click on Restore resurrects stale tabs). Mark the
+  # previous exit clean before launching. Cosmetic-only: page data and logins
+  # are flushed by CDP close regardless.
+  local prefs="$PW_PROFILE_DIR/Default/Preferences"
+  if [[ -f "$prefs" ]]; then
+    python3 - "$prefs" <<'PYEOF' || true
+import json, sys
+path = sys.argv[1]
+with open(path) as f:
+    prefs = json.load(f)
+profile = prefs.setdefault("profile", {})
+profile["exit_type"] = "Normal"
+profile["exited_cleanly"] = True
+with open(path, "w") as f:
+    json.dump(prefs, f)
+PYEOF
+  fi
   PROFILE_ARGS=(--persistent --profile "$PW_PROFILE_DIR")
 }
 
