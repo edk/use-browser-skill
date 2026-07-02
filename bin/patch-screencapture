@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# patch-screencapture — make playwright-cli screenshots bypass macOS ScreenCaptureKit.
+#
+# Why: playwright-core's CDP screenshot omits fromSurface, which defaults to true.
+# On macOS that routes every capture through ScreenCaptureKit and the replayd
+# daemon, costing up to a core per busy browser (fan spin-up). fromSurface:false
+# captures the renderer's own bitmap: same pixels, zero replayd involvement.
+# Verified 2026-07-02 on Chrome 149 / @playwright/cli 0.1.14.
+#
+# Idempotent. Re-run after `npm i -g @playwright/cli` (updates replace the bundle).
+# The running cliDaemon keeps the old code until restarted: `playwright-cli kill-all`.
+set -euo pipefail
+
+PW_BIN="${PW_BIN:-playwright-cli}"
+root="$(command -v "$PW_BIN" | xargs realpath | xargs dirname)/.."
+bundle="$(cd "$root" && pwd)/node_modules/playwright-core/lib/coreBundle.js"
+[[ -f "$bundle" ]] || bundle="/opt/homebrew/lib/node_modules/@playwright/cli/node_modules/playwright-core/lib/coreBundle.js"
+[[ -f "$bundle" ]] || { echo "patch-screencapture: coreBundle.js not found" >&2; exit 1; }
+
+if grep -q 'captureBeyondViewport: !fitsViewport, fromSurface: false' "$bundle"; then
+  echo "patch-screencapture: already patched ($bundle)"
+  exit 0
+fi
+
+if ! grep -q 'captureBeyondViewport: !fitsViewport }' "$bundle"; then
+  echo "patch-screencapture: expected call site not found — playwright-core changed; update this script" >&2
+  exit 1
+fi
+
+sed -i '' 's/captureBeyondViewport: !fitsViewport }/captureBeyondViewport: !fitsViewport, fromSurface: false }/' "$bundle"
+echo "patch-screencapture: patched $bundle"
+echo "restart the daemon to load it: $PW_BIN kill-all"
