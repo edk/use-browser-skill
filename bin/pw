@@ -27,6 +27,11 @@ session_running() {
   "$PW_BIN" list 2>/dev/null | grep -qE "^[[:space:]]*-?[[:space:]]*${PW_SESSION}:"
 }
 
+# Strip leading --persistent flag — pw always reuses the named session; this
+# flag is a common mistake and would otherwise bypass the open/session_running
+# logic by hitting the wildcard case and spawning a new browser context.
+while [[ "${1:-}" == "--persistent" ]]; do shift; done
+
 cmd="${1:-help}"
 case "$cmd" in
   help|-h|--help)
