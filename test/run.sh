@@ -6,6 +6,9 @@ STUB_DIR="$REPO/test/stub"
 PW="$REPO/bin/pw"
 PASS=0; FAIL=0
 
+# Isolate the persistent profile dir so tests never touch the real ~/.cache.
+export PW_PROFILE_DIR="$(mktemp -d)/profile"
+
 run_pw() {
   REC="$(mktemp)"
   PATH="$STUB_DIR:$PATH" STUB_RECORD="$REC" PW_SCRATCH_DIR="$(mktemp -d)" \
@@ -41,13 +44,47 @@ else echo "FAIL: selftest happy path"; sed 's/^/    /' /tmp/pw_st; FAIL=$((FAIL+
 
 # --- Task 4: idempotent open ---
 run_pw open http://x
-assert_contains "$REC" "-s=pw open http://x" "open launches when nothing running"
+assert_contains "$REC" "-s=pw open --persistent --profile" "open launches with persistent profile by default"
+assert_contains "$REC" "http://x" "open navigates to url on launch"
 
 REC="$(mktemp)"
 PATH="$STUB_DIR:$PATH" STUB_RECORD="$REC" STUB_SESSIONS='### Browsers\n- pw:\n  - status: open\n  - browser-type: chrome\n  - user-data-dir: <in-memory>\n  - headed: true\n' \
   PW_SCRATCH_DIR="$(mktemp -d)" "$PW" open http://x >/dev/null 2>&1
 assert_contains "$REC" "-s=pw goto http://x" "open reuses running session via goto"
 assert_not_contains "$REC" "-s=pw open" "open does not relaunch a running session"
+assert_not_contains "$REC" "--persistent" "reuse path passes no profile flags (browser already launched)"
+
+# --- Persistence + lifecycle (login-once) ---
+# Ephemeral override drops the persistent profile.
+REC="$(mktemp)"
+PATH="$STUB_DIR:$PATH" STUB_RECORD="$REC" PW_EPHEMERAL=1 PW_SCRATCH_DIR="$(mktemp -d)" \
+  "$PW" open http://e1 >/dev/null 2>&1
+assert_contains "$REC" "-s=pw open http://e1" "ephemeral: launches in-memory"
+assert_not_contains "$REC" "--persistent" "ephemeral: no --persistent flag"
+
+# fresh: force a new browser (close, then relaunch persistent).
+REC="$(mktemp)"
+PATH="$STUB_DIR:$PATH" STUB_RECORD="$REC" PW_SCRATCH_DIR="$(mktemp -d)" \
+  "$PW" fresh http://f1 >/dev/null 2>&1
+assert_contains "$REC" "-s=pw close" "fresh: closes existing session first"
+assert_contains "$REC" "-s=pw open --persistent --profile" "fresh: relaunches with persistent profile"
+assert_contains "$REC" "http://f1" "fresh: navigates to url"
+
+# forget: clear the saved login profile.
+FORGET_PROF="$(mktemp -d)/profile"; mkdir -p "$FORGET_PROF"; touch "$FORGET_PROF/cookies"
+REC="$(mktemp)"
+PATH="$STUB_DIR:$PATH" STUB_RECORD="$REC" PW_PROFILE_DIR="$FORGET_PROF" PW_SCRATCH_DIR="$(mktemp -d)" \
+  "$PW" forget >/dev/null 2>&1
+assert_contains "$REC" "-s=pw close" "forget: closes session first"
+if [[ -d "$FORGET_PROF" ]]; then echo "FAIL: forget left profile dir"; FAIL=$((FAIL+1)); else echo "ok: forget removed profile dir"; PASS=$((PASS+1)); fi
+
+# nuke: kills sessions + wipes scratch but PRESERVES the login profile.
+KEEP_PROF="$(mktemp -d)/profile"; mkdir -p "$KEEP_PROF"; touch "$KEEP_PROF/cookies"
+NUKE2="$(mktemp -d)"
+REC="$(mktemp)"
+PATH="$STUB_DIR:$PATH" STUB_RECORD="$REC" PW_PROFILE_DIR="$KEEP_PROF" PW_SCRATCH_DIR="$NUKE2" \
+  "$PW" nuke >/dev/null 2>&1
+if [[ -d "$KEEP_PROF" ]]; then echo "ok: nuke preserved login profile"; PASS=$((PASS+1)); else echo "FAIL: nuke wiped login profile"; FAIL=$((FAIL+1)); fi
 
 # --- Task 3: verbs ---
 run_pw status
