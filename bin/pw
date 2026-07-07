@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# pw — wrapper around playwright-cli (headed, one reusable session, persistent
-# login, artifacts out of repo). Targets bash 3.2 (macOS default). See SKILL.md.
+# pw — wrapper around playwright-cli (headless by default, one reusable session,
+# persistent login, artifacts out of repo). Targets bash 3.2 (macOS default).
+# See SKILL.md.
 set -euo pipefail
 
 PW_BIN="${PW_BIN:-playwright-cli}"
@@ -16,7 +17,19 @@ die() { echo "pw: $*" >&2; exit 2; }
 command -v "$PW_BIN" >/dev/null 2>&1 || \
   die "playwright-cli not found on PATH. Install: npm i -g @playwright/cli@latest"
 
-export PLAYWRIGHT_MCP_HEADLESS="${PLAYWRIGHT_MCP_HEADLESS:-false}"
+# Headless by default: invisible, cheap to keep open, no desktop clutter.
+# 'pw show' relaunches headed (visible) and persists that choice in a mode file;
+# 'pw hide' switches back. An explicit PLAYWRIGHT_MCP_HEADLESS env always wins.
+PW_STATE_DIR="$(dirname "$PW_PROFILE_DIR")"
+PW_MODE_FILE="$PW_STATE_DIR/headed"
+if [[ -z "${PLAYWRIGHT_MCP_HEADLESS:-}" ]]; then
+  if [[ -e "$PW_MODE_FILE" ]]; then
+    PLAYWRIGHT_MCP_HEADLESS=false
+  else
+    PLAYWRIGHT_MCP_HEADLESS=true
+  fi
+fi
+export PLAYWRIGHT_MCP_HEADLESS
 mkdir -p "$PW_SCRATCH_DIR" || die "cannot create scratch dir: $PW_SCRATCH_DIR"
 export PLAYWRIGHT_MCP_OUTPUT_DIR="${PLAYWRIGHT_MCP_OUTPUT_DIR:-$PW_SCRATCH_DIR}"
 
@@ -39,11 +52,33 @@ esac
 # Plain grep on the session name is not sufficient — closed sessions remain in
 # `playwright-cli list` output under "Browser servers available for attach",
 # causing false positives that send `pw open` to `goto` against a dead session.
+# NB: an exit in an awk END block overrides any exit code set in the body, so
+# the verdict must be carried into END via a flag, not exited early.
 session_running() {
   "$PW_BIN" list 2>/dev/null | awk \
     -v s="^- ${PW_SESSION}:" \
-    '$0 ~ s {found=1; next} found && /status: open/ {exit 0} found && /^-/ {exit 1} END {exit 1}' \
+    '$0 ~ s {found=1; next} found && /status: open/ {ok=1; exit} found && /^-/ {exit} END {exit ok ? 0 : 1}' \
     2>/dev/null
+}
+
+# Exit 0 if the open session is headed (visible), 1 if headless or absent.
+session_headed() {
+  "$PW_BIN" list 2>/dev/null | awk \
+    -v s="^- ${PW_SESSION}:" \
+    '$0 ~ s {found=1; next} found && /headed: true/ {ok=1; exit} found && /^-/ {exit} END {exit ok ? 0 : 1}' \
+    2>/dev/null
+}
+
+# Print PIDs of processes holding the persistent profile (empty if none).
+# Matched by user-data-dir with grep -F: fixed-string, catches Chrome and
+# Chromium, never matches unrelated browsers or other profiles.
+profile_browser_pids() {
+  [[ -d "$PW_PROFILE_DIR" ]] || return 0
+  local real_profile
+  real_profile="$(cd "$PW_PROFILE_DIR" 2>/dev/null && pwd || echo "$PW_PROFILE_DIR")"
+  ps -axo pid=,command= 2>/dev/null \
+    | grep -F -e "user-data-dir=${PW_PROFILE_DIR}" -e "user-data-dir=${real_profile}" \
+    | grep -v grep | awk '{print $1}' || true
 }
 
 # Populate PROFILE_ARGS with the flags that pin a fresh launch to the persistent
@@ -60,15 +95,17 @@ profile_launch_args() {
   local prefs="$PW_PROFILE_DIR/Default/Preferences"
   if [[ -f "$prefs" ]]; then
     python3 - "$prefs" <<'PYEOF' || true
-import json, sys
+import json, os, sys
 path = sys.argv[1]
 with open(path) as f:
     prefs = json.load(f)
 profile = prefs.setdefault("profile", {})
 profile["exit_type"] = "Normal"
 profile["exited_cleanly"] = True
-with open(path, "w") as f:
+tmp = path + ".pw-tmp"
+with open(tmp, "w") as f:
     json.dump(prefs, f)
+os.replace(tmp, path)
 PYEOF
   fi
   PROFILE_ARGS=(--persistent --profile "$PW_PROFILE_DIR")
@@ -77,10 +114,27 @@ PYEOF
 # Remove the cached .session file for PW_SESSION from the playwright daemon dir.
 # The daemon caches launch options (including headless:true/false) in this file and
 # reuses them on subsequent opens, ignoring the current PLAYWRIGHT_MCP_HEADLESS env.
-# Deleting it before launch forces a fresh session that picks up headless=false.
+# Deleting it before launch forces a fresh session that picks up the current mode.
+# The daemon dir is GLOBAL across workspaces: a record whose socket is still
+# alive belongs to another workspace's live session — deleting it orphans that
+# browser. Only stale records (socket gone) may be removed.
 clear_session_cache() {
-  find "${HOME}/Library/Caches/ms-playwright/daemon" -maxdepth 2 \
-    -name "${PW_SESSION}.session" -delete 2>/dev/null || true
+  local f
+  { find "${HOME}/Library/Caches/ms-playwright/daemon" -maxdepth 2 \
+      -name "${PW_SESSION}.session" 2>/dev/null || true; } | while IFS= read -r f; do
+    python3 - "$f" <<'PYEOF' || true
+import json, os, sys
+path = sys.argv[1]
+try:
+    with open(path) as fh:
+        sock = json.load(fh).get("socketPath", "")
+except Exception:
+    sock = ""
+if not sock or not os.path.exists(sock):
+    os.unlink(path)
+PYEOF
+  done
+  return 0
 }
 
 # Kill any Chrome processes whose --user-data-dir matches PW_PROFILE_DIR, and clean
@@ -89,23 +143,60 @@ clear_session_cache() {
 # and the profile locked. A locked profile causes "Browser is already in use" on
 # the next open. This only targets pw's profile — it never touches a Chrome instance
 # using a different profile (e.g. the user's regular browser).
+# NB: runs under set -euo pipefail — every step must be guarded so a no-match
+# never aborts the script mid-verb (a bare pgrep with zero matches did exactly
+# that, truncating end/fresh/forget/nuke).
 kill_profile_browsers() {
   [[ "$PW_EPHEMERAL" == "1" ]] && return 0
   [[ -d "$PW_PROFILE_DIR" ]] || return 0
-  local real_profile
-  real_profile="$(cd "$PW_PROFILE_DIR" 2>/dev/null && pwd || echo "$PW_PROFILE_DIR")"
-  pgrep -lf "Google Chrome\|Chromium" 2>/dev/null | while IFS=' ' read -r pid _; do
-    local cmdline
-    cmdline=$(ps -p "$pid" -o command= 2>/dev/null || true)
-    if echo "$cmdline" | grep -qF "user-data-dir=${PW_PROFILE_DIR}" || \
-       echo "$cmdline" | grep -qF "user-data-dir=${real_profile}"; then
-      kill "$pid" 2>/dev/null || true
-    fi
-  done
+  local pids pid alive i
+  pids="$(profile_browser_pids)"
+  if [[ -n "$pids" ]]; then
+    for pid in $pids; do kill "$pid" 2>/dev/null || true; done
+    # Give Chrome a moment to flush the profile and exit; force-kill stragglers.
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+      alive=""
+      for pid in $pids; do kill -0 "$pid" 2>/dev/null && alive=1 || true; done
+      [[ -z "$alive" ]] && break
+      sleep 0.2
+    done
+    for pid in $pids; do
+      kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+    done
+  fi
   # Remove Chrome profile lock files so the next open doesn't get "already in use".
+  # Safe here: nothing holds the profile anymore.
   rm -f "${PW_PROFILE_DIR}/SingletonLock" \
         "${PW_PROFILE_DIR}/SingletonSocket" \
         "${PW_PROFILE_DIR}/SingletonCookie" 2>/dev/null || true
+  return 0
+}
+
+# Close the session (capturing its current URL) and relaunch on the same
+# persistent profile with the given headless mode. Logins survive on disk;
+# the page is restored. This is how show/hide "switch" modes — a running
+# Chrome cannot change headedness in place.
+relaunch_with_mode() {
+  local want_headless="$1" url=""
+  if session_running; then
+    url="$("$PW_BIN" -s="$PW_SESSION" --raw eval 'location.href' 2>/dev/null | head -1 || true)"
+    url="${url%\"}"; url="${url#\"}"
+    "$PW_BIN" -s="$PW_SESSION" close >/dev/null 2>&1 || true
+  fi
+  kill_profile_browsers
+  profile_launch_args
+  clear_session_cache
+  # playwright-cli blocks file: URLs, so only web URLs are worth restoring.
+  case "$url" in
+    http://*|https://*) ;;
+    *) url="" ;;
+  esac
+  if [[ -n "$url" ]]; then
+    PLAYWRIGHT_MCP_HEADLESS="$want_headless" \
+      exec "$PW_BIN" -s="$PW_SESSION" open ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"} "$url"
+  fi
+  PLAYWRIGHT_MCP_HEADLESS="$want_headless" \
+    exec "$PW_BIN" -s="$PW_SESSION" open ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}
 }
 
 # Strip leading --persistent flag — pw always reuses the named session; this
@@ -114,40 +205,108 @@ kill_profile_browsers() {
 while [[ "${1:-}" == "--persistent" ]]; do shift; done
 
 cmd="${1:-help}"
+
+# Best-effort last-used stamp for 'pw status'; read-only verbs don't count.
+case "$cmd" in
+  help|-h|--help|status|gc|list|selftest|--version|-V) ;;
+  *) mkdir -p "$PW_STATE_DIR" 2>/dev/null || true
+     date +%s > "$PW_STATE_DIR/last-used" 2>/dev/null || true ;;
+esac
 case "$cmd" in
   help|-h|--help)
     profile_mode="persistent ($PW_PROFILE_DIR)"
     [[ "$PW_EPHEMERAL" == "1" ]] && profile_mode="ephemeral (in-memory)"
+    pw_mode="headless (invisible)"
+    [[ "$PLAYWRIGHT_MCP_HEADLESS" == "false" ]] && pw_mode="headed (visible)"
     cat <<EOF
-pw — browser wrapper (headed; one reusable session '${PW_SESSION}'; artifacts in ${PW_SCRATCH_DIR})
+pw — browser wrapper (one reusable session '${PW_SESSION}'; currently ${pw_mode}; artifacts in ${PW_SCRATCH_DIR})
 
 Sessions are REUSED: 'pw open URL' navigates the existing browser instead of
 launching a new one. The browser uses a ${profile_mode} profile, so you log in
-(and pass 2FA) once and it sticks across launches and tasks. Opening a brand-new
-browser should be rare — prefer reusing what is already open.
+(and pass 2FA) once and it sticks across launches and tasks. The browser is
+headless by default; 'pw show' makes it visible when a human needs to see or
+act on it (logins, 2FA, watching), 'pw hide' makes it invisible again — both
+keep the profile and current page.
 
 Wrapper verbs:
   pw open URL   open (or reuse) the session and navigate
-  pw status     list running sessions
+  pw show       make the browser visible (relaunch headed; logins + page survive)
+  pw hide       make the browser invisible again (relaunch headless)
+  pw status     sessions, mode, last-used, orphan warnings
+  pw gc         reap orphaned profile browsers + clear stale locks
   pw fresh URL  force a NEW browser (close current, relaunch) — rare; only when needed
   pw forget     clear the saved login (close + delete the persistent profile)
   pw end        close the '${PW_SESSION}' session (saved login persists on disk)
   pw nuke       close-all + kill-all + kill profile browsers + wipe scratch dir
-  pw selftest   verify headed + no repo litter
+  pw selftest   verify session mode + no repo litter
   pw help       this help
 
-Env: PW_EPHEMERAL=1 (throwaway in-memory profile), PW_PROFILE_DIR (profile path).
+Env: PW_EPHEMERAL=1 (throwaway in-memory profile), PW_PROFILE_DIR (profile path),
+PLAYWRIGHT_MCP_HEADLESS=true|false (one-off mode override).
 All other commands pass through to playwright-cli, scoped to '${PW_SESSION}'.
 playwright-cli's own help follows:
 EOF
     "$PW_BIN" --help || true
     ;;
   status)
-    exec "$PW_BIN" list
+    "$PW_BIN" list || true
+    pw_mode="headless"; [[ "$PLAYWRIGHT_MCP_HEADLESS" == "false" ]] && pw_mode="headed"
+    echo "pw: default mode: $pw_mode ('pw show' / 'pw hide' to switch)"
+    if [[ -f "$PW_STATE_DIR/last-used" ]]; then
+      last_used="$(date -r "$(cat "$PW_STATE_DIR/last-used" 2>/dev/null)" 2>/dev/null || true)"
+      [[ -n "$last_used" ]] && echo "pw: last used: $last_used"
+    fi
+    if ! session_running; then
+      orphans="$(profile_browser_pids)"
+      if [[ -n "$orphans" ]]; then
+        echo "pw: WARNING: orphaned browser process(es) holding the profile: $(echo $orphans)"
+        echo "pw: run 'pw gc' to clean up ('pw open URL' also reaps them automatically)."
+      fi
+    fi
+    ;;
+  show)
+    mkdir -p "$PW_STATE_DIR" 2>/dev/null || true
+    touch "$PW_MODE_FILE" 2>/dev/null || true
+    if session_running && session_headed; then
+      echo "pw: browser is already visible (headed)."
+      exit 0
+    fi
+    if ! session_running; then
+      echo "pw: no session open; headed mode saved — the next 'pw open URL' will be visible."
+      exit 0
+    fi
+    echo "pw: relaunching headed on the same profile (logins and page survive)…"
+    relaunch_with_mode false
+    ;;
+  hide)
+    rm -f "$PW_MODE_FILE" 2>/dev/null || true
+    if session_running && ! session_headed; then
+      echo "pw: browser is already headless."
+      exit 0
+    fi
+    if ! session_running; then
+      echo "pw: no session open; headless mode saved — future opens will be invisible."
+      exit 0
+    fi
+    echo "pw: relaunching headless on the same profile (logins and page survive)…"
+    relaunch_with_mode true
+    ;;
+  gc)
+    if session_running; then
+      echo "pw: session '${PW_SESSION}' is open and tracked — nothing to clean ('pw end' closes it)."
+    else
+      kill_profile_browsers
+      echo "pw: cleaned up — orphaned profile browsers reaped, stale locks cleared."
+    fi
     ;;
   end)
     "$PW_BIN" -s="$PW_SESSION" close 2>/dev/null || true
     kill_profile_browsers
+    if [[ "$PW_EPHEMERAL" == "1" ]]; then
+      echo "pw: session '${PW_SESSION}' closed."
+    else
+      echo "pw: session '${PW_SESSION}' closed (login profile kept: $PW_PROFILE_DIR)."
+    fi
     ;;
   fresh)
     shift
@@ -172,25 +331,38 @@ EOF
     ;;
   selftest)
     tmp="$(mktemp -d)"; rc=0
+    # Fully isolated: own profile, scratch, AND session name. Session names
+    # resolve globally across workspaces — running selftest under the shared
+    # name 'pw' opens/closes/clears a live pw session out from under its owner.
+    export PW_SESSION="pw-selftest"
     export PW_PROFILE_DIR="$tmp/profile"
     export PW_SCRATCH_DIR="$tmp/scratch"
     mkdir -p "$tmp/scratch"
 
     "$SELF" open about:blank >/dev/null
 
+    # The resolved mode is exported, so the child open above inherits it; the
+    # session in `list` must match it.
+    want="headed: false"; want_word="headless"
+    if [[ "$PLAYWRIGHT_MCP_HEADLESS" == "false" ]]; then
+      want="headed: true"; want_word="headed"
+    fi
     # pw always cds to PW_SCRATCH_DIR, so playwright-cli list must also run from there
     # to hit the same daemon context.
-    if (cd "$PW_SCRATCH_DIR" && "$PW_BIN" list) | awk -v s="$PW_SESSION" '
+    if (cd "$PW_SCRATCH_DIR" && "$PW_BIN" list) | awk -v s="$PW_SESSION" -v w="$want" '
           $0 ~ "^[[:space:]]*-[[:space:]]*" s ":" {f=1; next}
           /^-[[:space:]]/ {f=0}
-          f && /headed: true/ {print "Y"}
+          f && index($0, w) {print "Y"}
         ' | grep -q Y; then :
-    else echo "FAIL: session is not headed"; rc=1; fi
+    else echo "FAIL: session mode mismatch (want $want)"; rc=1; fi
     "$SELF" end >/dev/null 2>&1 || true
+    # Remove the selftest session's daemon records (they persist after close).
+    find "${HOME}/Library/Caches/ms-playwright/daemon" -maxdepth 2 \
+      -name "${PW_SESSION}.*" -delete 2>/dev/null || true
     rm -rf "$tmp"
     if [[ $rc -eq 0 ]]; then
       mode="persistent"; [[ "$PW_EPHEMERAL" == "1" ]] && mode="ephemeral"
-      echo "PASS: headed, single session, $mode login, no repo litter (artifacts -> $PW_SCRATCH_DIR)"
+      echo "PASS: $want_word, single session, $mode login, no repo litter (artifacts -> $PW_SCRATCH_DIR)"
     fi
     exit "$rc"
     ;;
@@ -209,6 +381,10 @@ EOF
         echo "pw: session '${PW_SESSION}' already open (reusing). 'pw status' to inspect; 'pw fresh URL' to force a new browser."
       fi
     else
+      # No live session in the registry, so any process still holding the
+      # profile is an orphan that would fail the launch with "Browser is
+      # already in use". Reap it first — this makes open self-healing.
+      kill_profile_browsers
       profile_launch_args
       clear_session_cache
       exec "$PW_BIN" -s="$PW_SESSION" open ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"} "$@"
