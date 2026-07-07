@@ -35,27 +35,27 @@ assert_rc() {
 
 # --- Task 1: env defaults + passthrough ---
 run_pw goto http://example.com
-assert_contains "$REC" "ENV PLAYWRIGHT_MCP_HEADLESS=true" "goto: headless default set"
+assert_contains "$REC" "ENV PLAYWRIGHT_MCP_HEADLESS=false" "goto: headed default set"
 assert_contains "$REC" "ENV PLAYWRIGHT_MCP_OUTPUT_DIR=" "goto: output dir exported"
 assert_contains "$REC" "goto http://example.com" "goto: command passed through"
 
-# Mode file (set by pw show) flips the default to headed; caller env still wins.
-MODE_STATE="$(mktemp -d)"; mkdir -p "$MODE_STATE/profile"; touch "$MODE_STATE/headed"
+# Mode file (set by pw hide) flips the default to headless; caller env still wins.
+MODE_STATE="$(mktemp -d)"; mkdir -p "$MODE_STATE/profile"; printf 'headless\n' > "$MODE_STATE/mode"
 REC="$(mktemp)"
 PATH="$STUB_DIR:$PATH" STUB_RECORD="$REC" PW_PROFILE_DIR="$MODE_STATE/profile" PW_SCRATCH_DIR="$(mktemp -d)" \
   "$PW" goto http://m1 >/dev/null 2>&1
-assert_contains "$REC" "ENV PLAYWRIGHT_MCP_HEADLESS=false" "mode file 'headed' flips default to headed"
+assert_contains "$REC" "ENV PLAYWRIGHT_MCP_HEADLESS=true" "mode file 'headless' flips default to headless"
 REC="$(mktemp)"
-PATH="$STUB_DIR:$PATH" STUB_RECORD="$REC" PLAYWRIGHT_MCP_HEADLESS=true PW_PROFILE_DIR="$MODE_STATE/profile" PW_SCRATCH_DIR="$(mktemp -d)" \
+PATH="$STUB_DIR:$PATH" STUB_RECORD="$REC" PLAYWRIGHT_MCP_HEADLESS=false PW_PROFILE_DIR="$MODE_STATE/profile" PW_SCRATCH_DIR="$(mktemp -d)" \
   "$PW" goto http://m2 >/dev/null 2>&1
-assert_contains "$REC" "ENV PLAYWRIGHT_MCP_HEADLESS=true" "caller env overrides mode file"
+assert_contains "$REC" "ENV PLAYWRIGHT_MCP_HEADLESS=false" "caller env overrides mode file"
 
 # --- Task 5: selftest happy path (hermetic; stub fakes a headless session) ---
 # selftest must run under its own session name: with the shared name 'pw' its
 # open/close/cache-clear resolve globally and destroy a live pw session in
 # another workspace (this happened).
 REC="$(mktemp)"
-PATH="$STUB_DIR:$PATH" STUB_RECORD="$REC" STUB_SESSIONS='### Browsers\n- pw-selftest:\n  - status: open\n  - browser-type: chrome\n  - user-data-dir: <in-memory>\n  - headed: false\n' \
+PATH="$STUB_DIR:$PATH" STUB_RECORD="$REC" STUB_SESSIONS='### Browsers\n- pw-selftest:\n  - status: open\n  - browser-type: chrome\n  - user-data-dir: <in-memory>\n  - headed: true\n' \
   PW_SCRATCH_DIR="$(mktemp -d)" "$PW" selftest >/tmp/pw_st 2>&1
 if [[ "$?" -eq 0 ]] && grep -q "PASS:" /tmp/pw_st; then echo "ok: selftest happy path exits 0/PASS"; PASS=$((PASS+1))
 else echo "FAIL: selftest happy path"; sed 's/^/    /' /tmp/pw_st; FAIL=$((FAIL+1)); fi
@@ -179,7 +179,7 @@ assert_contains "$REC" "-s=pw close" "show: closes headless session"
 assert_contains "$REC" "-s=pw open --persistent --profile" "show: relaunches persistent"
 assert_contains "$REC" "https://example.com/page" "show: restores current URL"
 assert_contains "$REC" "ENV PLAYWRIGHT_MCP_HEADLESS=false" "show: relaunch is headed"
-if [[ -e "$SH_STATE/headed" ]]; then echo "ok: show persists headed mode"; PASS=$((PASS+1))
+if [[ "$(cat "$SH_STATE/mode" 2>/dev/null)" == "headed" ]]; then echo "ok: show persists headed mode"; PASS=$((PASS+1))
 else echo "FAIL: show did not persist headed mode"; FAIL=$((FAIL+1)); fi
 
 # show is a no-op when the session is already headed.
@@ -200,8 +200,8 @@ assert_rc 0 "hide completes"
 assert_contains "$REC" "-s=pw close" "hide: closes headed session"
 assert_contains "$REC" "ENV PLAYWRIGHT_MCP_HEADLESS=true" "hide: relaunch is headless"
 assert_contains "$REC" "https://example.com/page" "hide: restores current URL"
-if [[ -e "$SH_STATE/headed" ]]; then echo "FAIL: hide left headed mode file"; FAIL=$((FAIL+1))
-else echo "ok: hide clears headed mode"; PASS=$((PASS+1)); fi
+if [[ "$(cat "$SH_STATE/mode" 2>/dev/null)" == "headless" ]]; then echo "ok: hide persists headless mode"; PASS=$((PASS+1))
+else echo "FAIL: hide did not persist headless mode"; FAIL=$((FAIL+1)); fi
 
 # --- gc: reaps orphans when no session is running ---
 GC_PROF="$(mktemp -d)/profile"; mkdir -p "$GC_PROF"
