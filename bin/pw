@@ -17,17 +17,16 @@ die() { echo "pw: $*" >&2; exit 2; }
 command -v "$PW_BIN" >/dev/null 2>&1 || \
   die "playwright-cli not found on PATH. Install: npm i -g @playwright/cli@latest"
 
-# Headless by default: invisible, cheap to keep open, no desktop clutter.
-# 'pw show' relaunches headed (visible) and persists that choice in a mode file;
-# 'pw hide' switches back. An explicit PLAYWRIGHT_MCP_HEADLESS env always wins.
+# Headed (visible) by default so the user can watch. 'pw hide' relaunches
+# headless for invisible background work and persists that choice in the mode
+# file; 'pw show' switches back. An explicit PLAYWRIGHT_MCP_HEADLESS env wins.
 PW_STATE_DIR="$(dirname "$PW_PROFILE_DIR")"
-PW_MODE_FILE="$PW_STATE_DIR/headed"
+PW_MODE_FILE="$PW_STATE_DIR/mode"
 if [[ -z "${PLAYWRIGHT_MCP_HEADLESS:-}" ]]; then
-  if [[ -e "$PW_MODE_FILE" ]]; then
-    PLAYWRIGHT_MCP_HEADLESS=false
-  else
-    PLAYWRIGHT_MCP_HEADLESS=true
-  fi
+  case "$(cat "$PW_MODE_FILE" 2>/dev/null || true)" in
+    headless) PLAYWRIGHT_MCP_HEADLESS=true ;;
+    *)        PLAYWRIGHT_MCP_HEADLESS=false ;;
+  esac
 fi
 export PLAYWRIGHT_MCP_HEADLESS
 mkdir -p "$PW_SCRATCH_DIR" || die "cannot create scratch dir: $PW_SCRATCH_DIR"
@@ -224,9 +223,8 @@ pw — browser wrapper (one reusable session '${PW_SESSION}'; currently ${pw_mod
 Sessions are REUSED: 'pw open URL' navigates the existing browser instead of
 launching a new one. The browser uses a ${profile_mode} profile, so you log in
 (and pass 2FA) once and it sticks across launches and tasks. The browser is
-headless by default; 'pw show' makes it visible when a human needs to see or
-act on it (logins, 2FA, watching), 'pw hide' makes it invisible again — both
-keep the profile and current page.
+visible (headed) by default; 'pw hide' makes it invisible for background work,
+'pw show' brings it back — both keep the profile and current page.
 
 Wrapper verbs:
   pw open URL   open (or reuse) the session and navigate
@@ -266,7 +264,7 @@ EOF
     ;;
   show)
     mkdir -p "$PW_STATE_DIR" 2>/dev/null || true
-    touch "$PW_MODE_FILE" 2>/dev/null || true
+    printf 'headed\n' > "$PW_MODE_FILE" 2>/dev/null || true
     if session_running && session_headed; then
       echo "pw: browser is already visible (headed)."
       exit 0
@@ -279,7 +277,8 @@ EOF
     relaunch_with_mode false
     ;;
   hide)
-    rm -f "$PW_MODE_FILE" 2>/dev/null || true
+    mkdir -p "$PW_STATE_DIR" 2>/dev/null || true
+    printf 'headless\n' > "$PW_MODE_FILE" 2>/dev/null || true
     if session_running && ! session_headed; then
       echo "pw: browser is already headless."
       exit 0

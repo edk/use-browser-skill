@@ -9,8 +9,9 @@
 A Claude Code skill that wraps `playwright-cli` with a `pw` command so the
 agent drives the browser the way you want:
 
-- headless by default (invisible, no desktop clutter); `pw show` relaunches it
-  visibly on the same profile and page when a human needs to see or act,
+- headed by default (you can watch); `pw hide` relaunches it headless on the
+  same profile and page for invisible background work (`pw show` to bring it
+  back) — headless also sidesteps headed Chrome's replayd connection storms,
 - one reusable session (no zombie browsers, no proliferation), with orphan
   reaping built into `pw open`, `pw gc`, and `pw end`,
 - a persistent login profile — sign in (and pass 2FA) once, and the session

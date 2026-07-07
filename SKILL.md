@@ -7,8 +7,8 @@ allowed-tools: Bash(pw:*)
 # use-browser
 
 Drive a real browser from the terminal with `pw`. ONE reusable session, a
-persistent login profile, headless (invisible) by default, and all artifacts
-written outside your repos.
+persistent login profile, a visible (headed) window by default, and all
+artifacts written outside your repos.
 
 ## The one rule
 
@@ -35,15 +35,16 @@ abandoned browsers running.
 - **`pw fresh <url>` is rare** — only for a genuinely clean slate (switching
   accounts, corrupted state). It closes the current browser and opens a new one.
 
-## Invisible by default — pw show / pw hide
+## Visible by default — pw hide / pw show
 
-The browser runs headless: no window appears, but navigation, snapshots,
-screenshots, and clicks all work normally. Switch modes when needed:
+The browser opens as a normal visible window so the human can watch. Switch
+modes when needed:
 
-- `pw show` — relaunch the browser visibly on the same profile and page.
-  Use when the human must see or act on the page (login walls, 2FA, watching
-  a flow), or asks to watch. The choice persists across restarts.
-- `pw hide` — return it to invisible, same profile and page.
+- `pw hide` — relaunch the browser headless (invisible) on the same profile
+  and page. Navigation, snapshots, screenshots, and clicks all keep working.
+  Use for long unattended background work, or when the user says the window
+  is in the way. The choice persists across restarts.
+- `pw show` — bring it back as a visible window, same profile and page.
 
 Both keep logins and the current page; the relaunch takes a few seconds.
 
@@ -59,10 +60,11 @@ asked for:
 
 1. **STOP.** Do not click through, do not type credentials or codes, do not
    assume the page loaded, do not move on to the next URL.
-2. **Run `pw show`** so the browser window is visible.
+2. **Make sure the window is visible** — if the browser is hidden (headless),
+   run `pw show` first.
 3. **Hand off to the human.** Say something like: "Jira is showing a login
-   screen — I've made the browser visible; please sign in there, then tell me
-   to continue."
+   screen in the browser window — please sign in there, then tell me to
+   continue."
 4. **Wait** for the human to confirm, then `pw snapshot` again to verify you
    are past the wall before doing anything else.
 
@@ -95,15 +97,16 @@ machine.
 ## Finishing up — ask, don't just abandon or kill
 
 When the whole task is done, ask the user whether to keep the browser open or
-close it, e.g.: "Done. Keep the browser open for follow-ups, or close it
-(`pw end`)?"
+close it, e.g.: "Done. Keep the browser window open for follow-ups, close it
+(`pw end`), or tuck it away invisibly (`pw hide`)?"
 
-- **Keeping it open is the default** and costs nothing while headless — the
-  next task reuses it instantly, and login state is safe either way.
-- If the browser is currently VISIBLE (`pw show` was used) and the task is
-  done, at least `pw hide` it if the user wants it kept; a visible abandoned
-  window is clutter.
-- `pw end` closes the browser cleanly; the login profile persists on disk.
+- **Keeping it open** means the next task reuses it instantly; login state is
+  safe either way.
+- **`pw hide`** keeps it running but off the desktop — good middle ground when
+  the user is done looking but more browser work is likely.
+- **`pw end`** closes the browser cleanly; the login profile persists on disk.
+- Never just walk away from a task leaving the window in a state the user
+  didn't ask for.
 
 ## Switching accounts or clearing a bad login
 
@@ -123,8 +126,8 @@ pw type "search text"
 pw screenshot --filename=shot.png
 pw eval "document.title"
 pw --raw eval "JSON.stringify(...)"   # clean output for piping
-pw show                         # make the browser visible (human needs to see/act)
-pw hide                         # back to invisible
+pw hide                         # tuck the browser away (headless background work)
+pw show                         # bring the window back
 pw status                       # session, mode, last used, orphan warnings
 pw gc                           # reap orphaned browsers + stale locks
 pw end                          # close browser when task is done (login persists)
