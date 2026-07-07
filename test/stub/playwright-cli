@@ -9,4 +9,7 @@ case "${1:-}" in
   --help) echo "stub: playwright-cli help" ;;
   list)   printf '%b' "${STUB_SESSIONS:-}" ;;
 esac
+case " $* " in
+  *" eval "*) printf '%s\n' "${STUB_EVAL:-}" ;;
+esac
 exit 0
