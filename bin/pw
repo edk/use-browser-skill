@@ -373,9 +373,21 @@ EOF
     ;;
   open)
     shift
+    # Refuse URLs that trigger file downloads or redirects to non-page content.
+    # These crash the pw IPC stream mid-launch: Chrome starts and acquires the
+    # Singleton lock, but the Node.js stream dies before the session registers,
+    # leaving Chrome orphaned. Known patterns: Google Docs /export, direct file
+    # downloads. Use curl/wget for downloads that don't need auth; for auth-gated
+    # content open the regular page URL and extract via screenshots or JS eval.
+    for arg in "$@"; do
+      case "$arg" in
+        */export\?format=*|*/export?format=*)
+          die "refusing download URL '$arg' — use the regular page URL instead (see skill docs)" ;;
+      esac
+    done
     if session_running; then
       if [[ $# -gt 0 ]]; then
-        exec "$PW_BIN" -s="$PW_SESSION" goto "$@"
+        "$PW_BIN" -s="$PW_SESSION" goto "$@" || { kill_profile_browsers; die "goto failed — profile browsers killed, lock cleared. Re-run pw open."; }
       else
         echo "pw: session '${PW_SESSION}' already open (reusing). 'pw status' to inspect; 'pw fresh URL' to force a new browser."
       fi
@@ -386,7 +398,7 @@ EOF
       kill_profile_browsers
       profile_launch_args
       clear_session_cache
-      exec "$PW_BIN" -s="$PW_SESSION" open ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"} "$@"
+      "$PW_BIN" -s="$PW_SESSION" open ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"} "$@" || { kill_profile_browsers; die "open failed — profile browsers killed, lock cleared. Re-run pw open."; }
     fi
     ;;
   *)
