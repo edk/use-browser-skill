@@ -11,6 +11,14 @@ PW_SCRATCH_DIR="${PW_SCRATCH_DIR:-${TMPDIR:-/tmp}/pw-cli}"
 # every later launch and task. PW_EPHEMERAL=1 opts back into throwaway in-memory.
 PW_EPHEMERAL="${PW_EPHEMERAL:-0}"
 PW_PROFILE_DIR="${PW_PROFILE_DIR:-${HOME}/.cache/pw-cli/profile}"
+# Chrome for Testing, not branded Chrome. playwright-cli's default channel is
+# branded /Applications/Google Chrome.app; two branded instances (this one +
+# the user's own Chrome) drive macOS replayd into a 100-300% CPU event-pump
+# spin until one exits (crbug.com/379347944, verified 2026-07-26 on Chrome
+# 150 / macOS 14.6). CfT never registers with replayd. Install once:
+# `playwright-cli install-browser chrome-for-testing`. PW_BROWSER=chrome
+# restores the old behavior if a site ever demands branded Chrome.
+PW_BROWSER="${PW_BROWSER:-chromium}"
 
 die() { echo "pw: $*" >&2; exit 2; }
 
@@ -192,10 +200,10 @@ relaunch_with_mode() {
   esac
   if [[ -n "$url" ]]; then
     PLAYWRIGHT_MCP_HEADLESS="$want_headless" \
-      exec "$PW_BIN" -s="$PW_SESSION" open ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"} "$url"
+      exec "$PW_BIN" -s="$PW_SESSION" open --browser "$PW_BROWSER" ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"} "$url"
   fi
   PLAYWRIGHT_MCP_HEADLESS="$want_headless" \
-    exec "$PW_BIN" -s="$PW_SESSION" open ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}
+    exec "$PW_BIN" -s="$PW_SESSION" open --browser "$PW_BROWSER" ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}
 }
 
 # Strip leading --persistent flag — pw always reuses the named session; this
@@ -313,7 +321,7 @@ EOF
     kill_profile_browsers
     profile_launch_args
     clear_session_cache
-    exec "$PW_BIN" -s="$PW_SESSION" open ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"} "$@"
+    exec "$PW_BIN" -s="$PW_SESSION" open --browser "$PW_BROWSER" ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"} "$@"
     ;;
   forget|logout)
     "$PW_BIN" -s="$PW_SESSION" close >/dev/null 2>&1 || true
@@ -398,7 +406,7 @@ EOF
       kill_profile_browsers
       profile_launch_args
       clear_session_cache
-      "$PW_BIN" -s="$PW_SESSION" open ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"} "$@" || { kill_profile_browsers; die "open failed — profile browsers killed, lock cleared. Re-run pw open."; }
+      "$PW_BIN" -s="$PW_SESSION" open --browser "$PW_BROWSER" ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"} "$@" || { kill_profile_browsers; die "open failed — profile browsers killed, lock cleared. Re-run pw open."; }
     fi
     ;;
   *)
