@@ -48,6 +48,17 @@ modes when needed:
 
 Both keep logins and the current page; the relaunch takes a few seconds.
 
+## After the human confirms login — NEVER call pw open again
+
+When a human says "logged in" or "done" after completing an auth flow:
+
+1. Run `pw snapshot` ONLY — do NOT call `pw open <url>` again.
+2. `pw open` kills the current browser and relaunches, wiping the session the human just created.
+3. If the snapshot confirms you're past the auth wall, navigate with `pw eval "location.href = 'url'"` or `pw click` — never `pw open`.
+4. If the snapshot still shows a login page, tell the human and wait again.
+
+This is the most common failure mode. Burn it in: **after login confirmed → `pw snapshot`, never `pw open`**.
+
 ## Logins and 2FA — STOP, do not push through
 
 The browser uses a persistent on-disk profile, so a human logs in (and passes
@@ -65,8 +76,7 @@ asked for:
 3. **Hand off to the human.** Say something like: "Jira is showing a login
    screen in the browser window — please sign in there, then tell me to
    continue."
-4. **Wait** for the human to confirm, then `pw snapshot` again to verify you
-   are past the wall before doing anything else.
+4. **Wait** for the human to confirm, then `pw snapshot` to verify — never `pw open`.
 
 Because the profile persists, this should happen at most once per site per
 machine.
@@ -77,6 +87,7 @@ machine.
 - call `playwright-cli` directly instead of `pw`;
 - open a fresh browser for each URL instead of reusing the running session;
 - call `pw end` in the middle of a task;
+- **call `pw open <url>` after the human says they logged in** — snapshot first, navigate with eval or click;
 - proceed after a snapshot shows "Sign in", "Log in", "Enter password",
   "Verify", "two-factor", "authenticator", or an Okta / SSO / Microsoft /
   Google login screen;
@@ -138,7 +149,52 @@ pw nuke                         # kill everything + wipe scratch dir
 
 Full command surface: `pw --help` (it appends `playwright-cli --help`).
 
+## pw eval — JS syntax rules
+
+`pw eval` runs in a restricted evaluator that does not support ES6+ syntax. Common failures:
+
+- `const`, `let`, arrow functions (`=>`), template literals, and trailing semicolons in multi-expression strings all cause `SyntaxError`.
+- `JSON.stringify(...)` with multi-line arrow-function callbacks is the most common pattern that breaks.
+
+Solutions:
+
+- Use `function` keyword instead of arrow functions.
+- Use `var` instead of `const`/`let`.
+- For multi-line JS, use `pw run-code` (runs a full Playwright code snippet) instead of `pw eval`.
+- When building selector queries that map or filter results, keep it as a single chained expression using `function(){}` callbacks throughout.
+
+Working example:
+
+```bash
+# GOOD — uses function keyword, no const/let
+pw --raw eval "JSON.stringify([...document.querySelectorAll('a')].map(function(a){return {text: a.innerText.trim(), href: a.href}}).filter(function(l){return l.text.length > 5}).slice(0,20), null, 2)"
+
+# BAD — arrow function causes SyntaxError
+pw --raw eval "JSON.stringify([...document.querySelectorAll('a')].map(a => ({text: a.innerText, href: a.href})), null, 2)"
+```
+
+## Clicking elements — use refs, not text
+
+When `pw click "some text"` fails with "does not match any elements", the element is likely in a shadow DOM or uses a non-standard role. The reliable workflow:
+
+1. Take `pw screenshot --filename=shot.png` and read `${TMPDIR:-/tmp}/pw-cli/shot.png` to visually locate the element.
+2. Take `pw snapshot` to get element refs (e.g. `e42`).
+3. Use `pw click e42` with the ref, or use `pw --raw eval` with a DOM query to `.click()` it directly.
+
+Do not retry `pw click "text"` with slight text variations — fall back to ref or eval click immediately.
+
 ## Artifacts
 
-Snapshots, screenshots, and traces go to a scratch dir outside any repo
-automatically. Do not write output paths into the project tree.
+`pw` changes its working directory to `${TMPDIR:-/tmp}/pw-cli` before every command, so all artifacts land there regardless of where you run `pw` from. A relative `--filename=shot.png` becomes `/tmp/pw-cli/shot.png` on Linux and `$TMPDIR/pw-cli/shot.png` on macOS.
+
+To read a screenshot back after taking it:
+
+```bash
+pw screenshot --filename=shot.png
+# then read it with the absolute path:
+find "${TMPDIR:-/tmp}/pw-cli" -name "shot.png" | tail -1
+# or just construct it directly:
+Read: ${TMPDIR:-/tmp}/pw-cli/shot.png
+```
+
+Do not try to read screenshots from the current working directory or the skill directory — they will not be there. Do not write `--filename` paths into the project tree.
