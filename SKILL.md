@@ -108,16 +108,20 @@ machine.
 ## Finishing up — ask, don't just abandon or kill
 
 When the whole task is done, ask the user whether to keep the browser open or
-close it, e.g.: "Done. Keep the browser window open for follow-ups, close it
-(`pw end`), or tuck it away invisibly (`pw hide`)?"
+close it, e.g.: "Done. Keep the browser window open for follow-ups, or close it
+(`pw end`)?"
 
 - **Keeping it open** means the next task reuses it instantly; login state is
   safe either way.
-- **`pw hide`** keeps it running but off the desktop — good middle ground when
-  the user is done looking but more browser work is likely.
 - **`pw end`** closes the browser cleanly; the login profile persists on disk.
 - Never just walk away from a task leaving the window in a state the user
   didn't ask for.
+
+**NEVER call `pw hide` at the end of a task.** `pw hide` persists headless mode
+across sessions — the next `pw open` will launch invisible with no window, and
+the user will see timeouts with no browser appearing. Only call `pw hide` if
+the user explicitly asks for it ("hide the browser", "run headless"). If the
+user hasn't asked, leave the browser visible or close it with `pw end`.
 
 ## Switching accounts or clearing a bad login
 
