@@ -65,7 +65,7 @@ assert_contains "$REC" "-s=pw-selftest" "selftest uses its own session name"
 
 # --- Task 4: idempotent open ---
 run_pw open http://x
-assert_contains "$REC" "-s=pw open --persistent --profile" "open launches with persistent profile by default"
+assert_contains "$REC" "-s=pw open --browser chromium --persistent --profile" "open launches with persistent profile by default"
 assert_contains "$REC" "http://x" "open navigates to url on launch"
 
 REC="$(mktemp)"
@@ -80,7 +80,7 @@ assert_not_contains "$REC" "--persistent" "reuse path passes no profile flags (b
 REC="$(mktemp)"
 PATH="$STUB_DIR:$PATH" STUB_RECORD="$REC" PW_EPHEMERAL=1 PW_SCRATCH_DIR="$(mktemp -d)" \
   "$PW" open http://e1 >/dev/null 2>&1
-assert_contains "$REC" "-s=pw open http://e1" "ephemeral: launches in-memory"
+assert_contains "$REC" "-s=pw open --browser chromium http://e1" "ephemeral: launches in-memory"
 assert_not_contains "$REC" "--persistent" "ephemeral: no --persistent flag"
 
 # fresh: force a new browser (close, then relaunch persistent).
@@ -88,7 +88,7 @@ REC="$(mktemp)"
 PATH="$STUB_DIR:$PATH" STUB_RECORD="$REC" PW_SCRATCH_DIR="$(mktemp -d)" \
   "$PW" fresh http://f1 >/dev/null 2>&1
 assert_contains "$REC" "-s=pw close" "fresh: closes existing session first"
-assert_contains "$REC" "-s=pw open --persistent --profile" "fresh: relaunches with persistent profile"
+assert_contains "$REC" "-s=pw open --browser chromium --persistent --profile" "fresh: relaunches with persistent profile"
 assert_contains "$REC" "http://f1" "fresh: navigates to url"
 
 # forget: clear the saved login profile.
@@ -113,12 +113,23 @@ assert_contains "$REC" "ARGV: list" "status -> list"
 run_pw end
 assert_contains "$REC" "-s=pw close" "end -> close session"
 
+# Plain `nuke` is scoped to this session: close-all/kill-all are machine-wide
+# and would take out other sessions' browsers, and the scratch dir is shared.
 NUKE_SCRATCH="$(mktemp -d)"; touch "$NUKE_SCRATCH/artifact.yml"
 REC="$(mktemp)"
 PATH="$STUB_DIR:$PATH" STUB_RECORD="$REC" PW_SCRATCH_DIR="$NUKE_SCRATCH" "$PW" nuke >/dev/null 2>&1
-assert_contains "$REC" "ARGV: close-all" "nuke -> close-all"
-assert_contains "$REC" "ARGV: kill-all" "nuke -> kill-all"
-if [[ -d "$NUKE_SCRATCH" ]]; then echo "FAIL: nuke left scratch dir"; FAIL=$((FAIL+1)); else echo "ok: nuke wiped scratch"; PASS=$((PASS+1)); fi
+assert_not_contains "$REC" "ARGV: close-all" "nuke does NOT close-all (would hit other sessions)"
+assert_not_contains "$REC" "ARGV: kill-all" "nuke does NOT kill-all (would hit other sessions)"
+assert_contains "$REC" "-s=pw close" "nuke closes only its own session"
+if [[ -d "$NUKE_SCRATCH" ]]; then echo "ok: nuke left shared scratch dir alone"; PASS=$((PASS+1)); else echo "FAIL: nuke wiped shared scratch dir"; FAIL=$((FAIL+1)); fi
+
+# `nuke --all` is the explicit machine-wide escape hatch: old behaviour.
+NUKE_SCRATCH="$(mktemp -d)"; touch "$NUKE_SCRATCH/artifact.yml"
+REC="$(mktemp)"
+PATH="$STUB_DIR:$PATH" STUB_RECORD="$REC" PW_SCRATCH_DIR="$NUKE_SCRATCH" "$PW" nuke --all >/dev/null 2>&1
+assert_contains "$REC" "ARGV: close-all" "nuke --all -> close-all"
+assert_contains "$REC" "ARGV: kill-all" "nuke --all -> kill-all"
+if [[ -d "$NUKE_SCRATCH" ]]; then echo "FAIL: nuke --all left scratch dir"; FAIL=$((FAIL+1)); else echo "ok: nuke --all wiped scratch"; PASS=$((PASS+1)); fi
 
 # --- Task 2: session injection ---
 run_pw goto http://x
@@ -176,7 +187,7 @@ PATH="$STUB_DIR:$PATH" STUB_RECORD="$REC" PW_PROFILE_DIR="$SH_STATE/profile" PW_
 RC=$?
 assert_rc 0 "show completes"
 assert_contains "$REC" "-s=pw close" "show: closes headless session"
-assert_contains "$REC" "-s=pw open --persistent --profile" "show: relaunches persistent"
+assert_contains "$REC" "-s=pw open --browser chromium --persistent --profile" "show: relaunches persistent"
 assert_contains "$REC" "https://example.com/page" "show: restores current URL"
 assert_contains "$REC" "ENV PLAYWRIGHT_MCP_HEADLESS=false" "show: relaunch is headed"
 if [[ "$(cat "$SH_STATE/mode" 2>/dev/null)" == "headed" ]]; then echo "ok: show persists headed mode"; PASS=$((PASS+1))
@@ -253,12 +264,101 @@ HEAL_PID=$!
 REC="$(mktemp)"
 PATH="$STUB_DIR:$PATH" STUB_RECORD="$REC" PW_PROFILE_DIR="$HEAL_PROF" PW_SCRATCH_DIR="$(mktemp -d)" \
   "$PW" open http://h1 >/dev/null 2>&1
-assert_contains "$REC" "-s=pw open --persistent --profile" "open with orphan still launches"
+assert_contains "$REC" "-s=pw open --browser chromium --persistent --profile" "open with orphan still launches"
 sleep 0.5
 if kill -0 "$HEAL_PID" 2>/dev/null; then
   echo "FAIL: open left orphan holding the profile"; kill -9 "$HEAL_PID" 2>/dev/null; FAIL=$((FAIL+1))
 else echo "ok: open reaped orphan before launching"; PASS=$((PASS+1)); fi
 wait "$HEAL_PID" 2>/dev/null
+
+# --- per-session isolation: name + profile derivation ---
+# Every case below runs WITHOUT the suite-wide PW_PROFILE_DIR export, because
+# an explicit profile is itself the opt-out from isolation.
+ISO_CACHE="$(mktemp -d)"
+iso_help() { # $1 = session id ('' for none); prints pw's first help line
+  if [[ -n "$1" ]]; then
+    env -u PW_PROFILE_DIR -u PW_SESSION PATH="$STUB_DIR:$PATH" \
+      CLAUDE_CODE_SESSION_ID="$1" PW_CACHE_DIR="$ISO_CACHE" PW_SCRATCH_DIR="$(mktemp -d)" \
+      "$PW" help 2>/dev/null | head -1
+  else
+    env -u PW_PROFILE_DIR -u PW_SESSION -u CLAUDE_CODE_SESSION_ID PATH="$STUB_DIR:$PATH" \
+      PW_CACHE_DIR="$ISO_CACHE" PW_SCRATCH_DIR="$(mktemp -d)" \
+      "$PW" help 2>/dev/null | head -1
+  fi
+}
+assert_line() { # haystack needle label
+  if printf '%s' "$1" | grep -qF -- "$2"; then echo "ok: $3"; PASS=$((PASS+1))
+  else echo "FAIL: $3"; echo "  want: $2"; echo "  got:  $1"; FAIL=$((FAIL+1)); fi
+}
+
+H_A="$(iso_help 'aaaaaaaa-1111-2222-3333-444444444444')"
+H_B="$(iso_help 'bbbbbbbb-1111-2222-3333-444444444444')"
+H_N="$(iso_help '')"
+assert_line "$H_A" "session 'pw-aaaaaaaa1111'" "session id A -> its own session name"
+assert_line "$H_B" "session 'pw-bbbbbbbb1111'" "session id B -> a different session name"
+assert_line "$H_A" "isolated to this agent session" "session id -> reported as isolated"
+assert_line "$H_N" "session 'pw'" "no session id -> legacy shared session name"
+assert_line "$H_N" "shared" "no session id -> reported as shared"
+
+# The profile must be keyed on the session too, or two windows fight one
+# userDataDir and Chromium refuses the second launch.
+REC="$(mktemp)"
+env -u PW_PROFILE_DIR -u PW_SESSION PATH="$STUB_DIR:$PATH" STUB_RECORD="$REC" \
+  CLAUDE_CODE_SESSION_ID='aaaaaaaa-1111-2222-3333-444444444444' \
+  PW_CACHE_DIR="$ISO_CACHE" PW_SCRATCH_DIR="$(mktemp -d)" \
+  "$PW" open http://iso1 >/dev/null 2>&1
+assert_contains "$REC" "-s=pw-aaaaaaaa1111 open" "isolated open uses the session-scoped name"
+assert_contains "$REC" "--profile $ISO_CACHE/sessions/aaaaaaaa1111/profile" "isolated open uses the session-scoped profile"
+
+# An explicit PW_PROFILE_DIR is the documented opt-in back to one shared browser;
+# it must also force the shared session name, or two differently-named sessions
+# would collide on one userDataDir.
+SHARED_PROF="$(mktemp -d)/profile"
+REC="$(mktemp)"
+env -u PW_SESSION PATH="$STUB_DIR:$PATH" STUB_RECORD="$REC" \
+  CLAUDE_CODE_SESSION_ID='aaaaaaaa-1111-2222-3333-444444444444' \
+  PW_PROFILE_DIR="$SHARED_PROF" PW_SCRATCH_DIR="$(mktemp -d)" \
+  "$PW" open http://iso2 >/dev/null 2>&1
+assert_contains "$REC" "-s=pw open" "explicit PW_PROFILE_DIR opts back into the shared session"
+assert_contains "$REC" "--profile $SHARED_PROF" "explicit PW_PROFILE_DIR is honoured"
+
+# forget must leave a marker, else the next open silently re-seeds from golden
+# and the user is logged back in despite being told they are logged out.
+FORGET_CACHE="$(mktemp -d)"
+mkdir -p "$FORGET_CACHE/golden/Default"; touch "$FORGET_CACHE/golden/Default/Cookies"
+env -u PW_PROFILE_DIR -u PW_SESSION PATH="$STUB_DIR:$PATH" \
+  CLAUDE_CODE_SESSION_ID='cccccccc-1111-2222-3333-444444444444' \
+  PW_CACHE_DIR="$FORGET_CACHE" PW_SCRATCH_DIR="$(mktemp -d)" \
+  "$PW" forget >/dev/null 2>&1
+if [[ -f "$FORGET_CACHE/sessions/cccccccc1111/no-seed" ]]; then
+  echo "ok: forget writes the no-seed marker"; PASS=$((PASS+1))
+else echo "FAIL: forget did not write the no-seed marker"; FAIL=$((FAIL+1)); fi
+REC="$(mktemp)"
+env -u PW_PROFILE_DIR -u PW_SESSION PATH="$STUB_DIR:$PATH" STUB_RECORD="$REC" \
+  CLAUDE_CODE_SESSION_ID='cccccccc-1111-2222-3333-444444444444' \
+  PW_CACHE_DIR="$FORGET_CACHE" PW_SCRATCH_DIR="$(mktemp -d)" \
+  "$PW" open http://iso3 >/dev/null 2>&1
+if [[ -f "$FORGET_CACHE/sessions/cccccccc1111/profile/Default/Cookies" ]]; then
+  echo "FAIL: open re-seeded from golden after forget"; FAIL=$((FAIL+1))
+else echo "ok: open does not re-seed after forget"; PASS=$((PASS+1)); fi
+
+# forget --golden clears the seed for future sessions too.
+env -u PW_PROFILE_DIR -u PW_SESSION PATH="$STUB_DIR:$PATH" \
+  CLAUDE_CODE_SESSION_ID='cccccccc-1111-2222-3333-444444444444' \
+  PW_CACHE_DIR="$FORGET_CACHE" PW_SCRATCH_DIR="$(mktemp -d)" \
+  "$PW" forget --golden >/dev/null 2>&1
+if [[ -d "$FORGET_CACHE/golden" ]]; then
+  echo "FAIL: forget --golden left the golden profile"; FAIL=$((FAIL+1))
+else echo "ok: forget --golden removes the golden profile"; PASS=$((PASS+1)); fi
+
+# status must name the session it is reporting on — `playwright-cli list` is
+# global and shows other agents' sessions in the same output.
+env -u PW_PROFILE_DIR -u PW_SESSION PATH="$STUB_DIR:$PATH" \
+  CLAUDE_CODE_SESSION_ID='aaaaaaaa-1111-2222-3333-444444444444' \
+  PW_CACHE_DIR="$ISO_CACHE" PW_SCRATCH_DIR="$(mktemp -d)" \
+  "$PW" status >/tmp/pw_status 2>&1
+assert_contains /tmp/pw_status "this session: 'pw-aaaaaaaa1111'" "status names its own session"
+assert_contains /tmp/pw_status "profile: $ISO_CACHE/sessions/aaaaaaaa1111/profile" "status names its own profile"
 
 echo "---- $PASS passed, $FAIL failed ----"
 [[ "$FAIL" -eq 0 ]]
