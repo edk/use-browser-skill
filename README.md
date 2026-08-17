@@ -12,10 +12,12 @@ agent drives the browser the way you want:
 - headed by default (you can watch); `pw hide` relaunches it headless on the
   same profile and page for invisible background work (`pw show` to bring it
   back) — headless also sidesteps headed Chrome's replayd connection storms,
-- one reusable session (no zombie browsers, no proliferation), with orphan
-  reaping built into `pw open`, `pw gc`, and `pw end`,
-- a persistent login profile — sign in (and pass 2FA) once, and the session
-  sticks across launches and tasks,
+- one reusable browser per agent session (no zombie browsers, no proliferation),
+  with orphan reaping built into `pw open`, `pw gc`, and `pw end`,
+- per-session isolation: concurrent agent sessions each get their own browser
+  and profile, so one session can never navigate or reap another's browser,
+- a persistent login profile — sign in (and pass 2FA) once, and it sticks for
+  the rest of that session; `pw promote` carries those logins to new sessions,
 - all snapshots/screenshots/traces written to a scratch dir, never into your repo.
 
 ## Install
@@ -39,26 +41,57 @@ lists the wrapper verbs:
 
 - `pw open <url>` — open or reuse the session and navigate (reaps orphans first)
 - `pw show` / `pw hide` — make the browser visible / invisible (same profile and page)
-- `pw status` — session, mode, last used, orphan warnings
-- `pw gc` — reap orphaned profile browsers and clear stale locks
+- `pw status` — your session name and profile, mode, last used, orphan warnings
+- `pw gc` — reap your orphaned browsers, stale locks, and abandoned profiles
 - `pw fresh <url>` — force a brand-new browser (rare)
-- `pw forget` — clear the saved login (delete the persistent profile)
+- `pw promote` — save this session's logins as the seed for new sessions
+- `pw forget` — clear this session's login (`--golden` also clears the seed)
 - `pw end` — close the session (saved login persists on disk)
-- `pw nuke` — kill everything and wipe the scratch dir (login profile kept)
+- `pw nuke` — reset this session (`--all` resets every session on the machine)
 - `pw selftest` — verify session mode and no repo litter
 
 All other commands pass through to `playwright-cli`.
 
 Because the browser uses a persistent on-disk profile, the first time you hit a
 site's login or 2FA wall the agent runs `pw show` and a human completes it in
-the visible window; after that the session is reused and you are not prompted
-again.
+the visible window; after that the browser is reused and you are not prompted
+again for the rest of that session.
+
+## Sessions and logins
+
+Session name and profile are keyed on `CLAUDE_CODE_SESSION_ID`, so two agent
+sessions running at once get two browsers and two profiles. Chromium cannot open
+two instances against one `userDataDir`, so separate windows require separate
+profiles: the two cannot be decoupled.
+
+The consequence is that a brand-new session does not automatically see the
+previous one's logins. `pw promote` closes that gap: run `pw end`, then
+`pw promote`, and the profile is copied to `~/.cache/pw-cli/golden`, which every
+new session is seeded from on its first launch. Leave the browser open about a
+minute after logging in before `pw end`, since Chromium flushes cookies to disk
+on a roughly 30 second timer and Playwright kills the browser on teardown.
+
+Profile copies skip Chromium's HTTP, code, and service-worker caches, which hold
+no auth state and dominate a long-lived profile (859 MB down to 22 MB, 7.2 s
+down to 0.23 s on a real one). Tab-restore state is skipped too, so a new
+session does not reopen the golden profile's tabs.
+
+With no `CLAUDE_CODE_SESSION_ID` (a plain terminal), `pw` falls back to the
+historical single shared session `pw` and profile `~/.cache/pw-cli/profile`.
+Setting `PW_PROFILE_DIR` explicitly opts back into that shared behaviour.
 
 ## Configuration
 
-- `PW_SESSION` — session name (default `pw`)
+- `PW_SESSION` — session name (default: `pw-<session-key>`, or `pw` with no
+  `CLAUDE_CODE_SESSION_ID`)
 - `PW_SCRATCH_DIR` — artifact scratch dir (default `${TMPDIR:-/tmp}/pw-cli`)
-- `PW_PROFILE_DIR` — persistent login profile (default `~/.cache/pw-cli/profile`)
+- `PW_CACHE_DIR` — state root (default `~/.cache/pw-cli`)
+- `PW_PROFILE_DIR` — explicit login profile; setting it opts back into one
+  profile shared by every session (default: per-session under `PW_CACHE_DIR`)
+- `PW_GOLDEN_DIR` — seed profile for new sessions (default `~/.cache/pw-cli/golden`)
+- `PW_SEED=0` — do not seed new sessions from the golden profile
+- `PW_SESSION_TTL_DAYS` — age at which `pw gc` reaps an unused session profile
+  (default 7)
 - `PW_EPHEMERAL=1` — use a throwaway in-memory profile (saves no login)
 - `PW_BIN` — `playwright-cli` binary (default `playwright-cli`)
 - `PLAYWRIGHT_MCP_HEADLESS=true|false` — one-off mode override; normally leave

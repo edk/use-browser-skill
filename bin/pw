@@ -5,12 +5,62 @@
 set -euo pipefail
 
 PW_BIN="${PW_BIN:-playwright-cli}"
-PW_SESSION="${PW_SESSION:-pw}"
 PW_SCRATCH_DIR="${PW_SCRATCH_DIR:-${TMPDIR:-/tmp}/pw-cli}"
+PW_CACHE_DIR="${PW_CACHE_DIR:-${HOME}/.cache/pw-cli}"
 # Persistent on-disk browser profile: log in (and pass 2FA) ONCE and reuse it on
 # every later launch and task. PW_EPHEMERAL=1 opts back into throwaway in-memory.
 PW_EPHEMERAL="${PW_EPHEMERAL:-0}"
-PW_PROFILE_DIR="${PW_PROFILE_DIR:-${HOME}/.cache/pw-cli/profile}"
+
+# --- Per-session isolation ---------------------------------------------------
+# Each concurrent agent session needs its OWN browser and its OWN profile.
+# Sharing them produced two distinct failures: session B's `pw open` saw A's
+# registry entry and issued `goto` against A's window (B then read the wrong
+# page and reported confident nonsense), and B's orphan reaper matched A's live
+# browser by user-data-dir and killed it. Chromium refuses two instances on one
+# userDataDir, so separate windows REQUIRE separate profiles — the two cannot be
+# decoupled.
+#
+# CLAUDE_CODE_SESSION_ID is unique across concurrent sessions and stable for a
+# session's lifetime including resume, so keying on it isolates sessions from
+# each other while keeping cookies (and therefore logins) continuous within one.
+# With no such id — a plain interactive terminal — fall back to the historical
+# shared session name and profile so hand use is unchanged.
+#
+# Setting PW_PROFILE_DIR explicitly is the supported opt-in to share a profile.
+pw_session_key() {
+  printf '%s' "${CLAUDE_CODE_SESSION_ID:-}" | tr -cd 'a-zA-Z0-9' | cut -c1-12
+}
+PW_SESSION_KEY="$(pw_session_key)"
+if [[ -n "${PW_PROFILE_DIR:-}" ]]; then
+  # Explicit profile = deliberate opt-in to today's shared behaviour. A shared
+  # profile REQUIRES a shared session name: two differently-named sessions
+  # pointing at one userDataDir would fight over Chromium's SingletonLock and
+  # reap each other. Default the name to match the shared profile.
+  PW_ISOLATED=0
+  PW_SESSION="${PW_SESSION:-pw}"
+  PW_STATE_DIR="${PW_STATE_DIR:-$(dirname "$PW_PROFILE_DIR")}"
+elif [[ -n "$PW_SESSION_KEY" ]]; then
+  PW_ISOLATED=1
+  PW_SESSION="${PW_SESSION:-pw-$PW_SESSION_KEY}"
+  PW_STATE_DIR="${PW_STATE_DIR:-$PW_CACHE_DIR/sessions/$PW_SESSION_KEY}"
+  PW_PROFILE_DIR="$PW_STATE_DIR/profile"
+else
+  PW_ISOLATED=0
+  PW_SESSION="${PW_SESSION:-pw}"
+  PW_STATE_DIR="${PW_STATE_DIR:-$PW_CACHE_DIR}"
+  PW_PROFILE_DIR="$PW_CACHE_DIR/profile"
+fi
+
+# Seed source for a new isolated session's profile, so a fresh session inherits
+# existing logins instead of starting logged out. Never launched against
+# directly — only copied from — which is what keeps the copy consistent and
+# keeps two sessions from racing over it. Populated by `pw promote`.
+# PW_SEED=0 disables seeding (new sessions then start logged out).
+PW_GOLDEN_DIR="${PW_GOLDEN_DIR:-$PW_CACHE_DIR/golden}"
+PW_SEED="${PW_SEED:-1}"
+# Days an unused isolated session profile is kept before `pw gc` reaps it.
+PW_SESSION_TTL_DAYS="${PW_SESSION_TTL_DAYS:-7}"
+
 # Chrome for Testing, not branded Chrome. playwright-cli's default channel is
 # branded /Applications/Google Chrome.app; two branded instances (this one +
 # the user's own Chrome) drive macOS replayd into a 100-300% CPU event-pump
@@ -28,7 +78,9 @@ command -v "$PW_BIN" >/dev/null 2>&1 || \
 # Headed (visible) by default so the user can watch. 'pw hide' relaunches
 # headless for invisible background work and persists that choice in the mode
 # file; 'pw show' switches back. An explicit PLAYWRIGHT_MCP_HEADLESS env wins.
-PW_STATE_DIR="$(dirname "$PW_PROFILE_DIR")"
+# The mode file lives in PW_STATE_DIR, so under isolation the choice is
+# per-session: 'pw hide' can no longer make an unrelated session launch
+# invisible, and a new session always starts at the headed default.
 PW_MODE_FILE="$PW_STATE_DIR/mode"
 if [[ -z "${PLAYWRIGHT_MCP_HEADLESS:-}" ]]; then
   case "$(cat "$PW_MODE_FILE" 2>/dev/null || true)" in
@@ -40,6 +92,16 @@ export PLAYWRIGHT_MCP_HEADLESS
 mkdir -p "$PW_SCRATCH_DIR" || die "cannot create scratch dir: $PW_SCRATCH_DIR"
 export PLAYWRIGHT_MCP_OUTPUT_DIR="${PLAYWRIGHT_MCP_OUTPUT_DIR:-$PW_SCRATCH_DIR}"
 
+# Absolute path to this script, so self-invocation survives a cd. Must be
+# resolved BEFORE the cd below: a relative $0 like `bin/pw` is only meaningful
+# against the caller's cwd, and resolving it afterwards looked for `bin/` inside
+# the scratch dir and broke `pw selftest` for any relative invocation.
+case "$0" in
+  /*)  SELF="$0" ;;
+  */*) SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")" ;;
+  *)   SELF="$(command -v "$0")" ;;
+esac
+
 # All playwright-cli calls must use PW_SCRATCH_DIR as their working directory.
 # playwright-cli uses cwd to determine which daemon instance to connect to (one
 # daemon per workspace, identified by a hash of the cwd). If different pw commands
@@ -47,13 +109,6 @@ export PLAYWRIGHT_MCP_OUTPUT_DIR="${PLAYWRIGHT_MCP_OUTPUT_DIR:-$PW_SCRATCH_DIR}"
 # sessions. cd here once so every subsequent playwright-cli call is in the same
 # context, regardless of where the user invoked pw from.
 cd "$PW_SCRATCH_DIR"
-
-# Absolute path to this script, so self-invocation survives a cd.
-case "$0" in
-  /*)  SELF="$0" ;;
-  */*) SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")" ;;
-  *)   SELF="$(command -v "$0")" ;;
-esac
 
 # Check that the named session exists AND has status: open.
 # Plain grep on the session name is not sufficient — closed sessions remain in
@@ -76,16 +131,150 @@ session_headed() {
     2>/dev/null
 }
 
-# Print PIDs of processes holding the persistent profile (empty if none).
-# Matched by user-data-dir with grep -F: fixed-string, catches Chrome and
-# Chromium, never matches unrelated browsers or other profiles.
+# Print PIDs of browsers holding the given profile dir (default: this session's).
+# This function decides what gets KILLED, so it must never match a browser
+# belonging to another session. Two properties matter:
+#   1. Exact directory match. A plain substring test on "user-data-dir=$DIR"
+#      also matches "$DIR-2" / "$DIR2", i.e. a different session's profile, so
+#      the character after the path must be a space or end-of-line.
+#   2. Space-tolerant. The path is compared as a substring rather than an argv
+#      token so a profile dir containing spaces still matches.
+# Chrome and Chromium both spell the flag --user-data-dir=PATH.
 profile_browser_pids() {
-  [[ -d "$PW_PROFILE_DIR" ]] || return 0
-  local real_profile
-  real_profile="$(cd "$PW_PROFILE_DIR" 2>/dev/null && pwd || echo "$PW_PROFILE_DIR")"
-  ps -axo pid=,command= 2>/dev/null \
-    | grep -F -e "user-data-dir=${PW_PROFILE_DIR}" -e "user-data-dir=${real_profile}" \
-    | grep -v grep | awk '{print $1}' || true
+  local dir="${1:-$PW_PROFILE_DIR}" real_dir snapshot
+  [[ -d "$dir" ]] || return 0
+  real_dir="$(cd "$dir" 2>/dev/null && pwd || echo "$dir")"
+  # Snapshot ps BEFORE awk exists. awk's own argv/env contains the profile path,
+  # so piping ps straight into awk makes awk match itself and report a phantom
+  # live browser (which then makes `pw status` cry orphan, `pw promote` refuse,
+  # and the stale sweep skip every directory).
+  snapshot="$(ps -axo pid=,command= 2>/dev/null || true)"
+  # Needles go through the environment, not `awk -v`: -v processes escape
+  # sequences in the VALUE, so a path containing a backslash would be silently
+  # mangled and match nothing.
+  printf '%s\n' "$snapshot" \
+    | PW_AWK_A="user-data-dir=$dir" PW_AWK_B="user-data-dir=$real_dir" awk '
+    BEGIN { a = ENVIRON["PW_AWK_A"]; b = ENVIRON["PW_AWK_B"] }
+    {
+      pid = $1
+      for (k = 0; k < 2; k++) {
+        needle = (k == 0 ? a : b)
+        p = index($0, needle)
+        if (p > 0) {
+          nextch = substr($0, p + length(needle), 1)
+          if (nextch == "" || nextch == " ") { print pid; break }
+        }
+      }
+    }' || true
+}
+
+# True when a directory exists and is non-empty.
+dir_has_content() {
+  [[ -d "$1" ]] || return 1
+  [[ -n "$(ls -A "$1" 2>/dev/null)" ]]
+}
+
+# Paths never worth copying between profiles. These are caches Chromium
+# regenerates on demand and hold no auth state: on a real long-lived profile
+# they were 812M of 859M, which is the difference between a 7 second stall on
+# every new session's first launch and a sub-second one (plus 859M of disk per
+# session). 'Sessions' is tab-restore state, so inheriting it would reopen the
+# golden profile's tabs in every new session, which nobody wants.
+PW_PROFILE_SKIP="Default/Cache
+Default/Code Cache
+Default/Service Worker
+Default/GPUCache
+Default/DawnWebGPUCache
+Default/DawnGraphiteCache
+Default/Shared Dictionary
+Default/Sessions
+Default/History
+GraphiteDawnCache
+GPUPersistentCache
+component_crx_cache"
+
+# Copy a browser profile, minus the caches, and clear the lock files the copy
+# must not inherit. Used for both directions: golden -> session and
+# session -> golden.
+# PW_NO_RSYNC=1 forces the cp fallback. It exists so the fallback is reachable
+# in tests: it is the path every machine without rsync takes, and an untested
+# copy path is how a profile silently arrives without its cookies.
+copy_profile() {
+  local src="$1" dst="$2" rel
+  if [[ "${PW_NO_RSYNC:-0}" != "1" ]] && command -v rsync >/dev/null 2>&1; then
+    local args=()
+    while IFS= read -r rel; do
+      [[ -n "$rel" ]] && args+=(--exclude "/$rel")
+    done <<< "$PW_PROFILE_SKIP"
+    rsync -a ${args[@]+"${args[@]}"} "$src/" "$dst/" 2>/dev/null || return 1
+  else
+    cp -R "$src" "$dst" 2>/dev/null || return 1
+    while IFS= read -r rel; do
+      [[ -n "$rel" ]] && rm -rf "$dst/$rel"
+    done <<< "$PW_PROFILE_SKIP"
+  fi
+  rm -f "$dst/SingletonLock" "$dst/SingletonSocket" \
+        "$dst/SingletonCookie" 2>/dev/null || true
+  return 0
+}
+
+# One-time migration. Before per-session profiles existed, every session shared
+# $PW_CACHE_DIR/profile, and that is where a long-standing user's logins live.
+# Adopt it as the golden seed the first time an isolated session needs one, so
+# switching to isolation does not read as "all my logins vanished".
+# Skipped while a browser holds it: copying a live profile tears the cookie DB.
+bootstrap_golden_from_legacy() {
+  dir_has_content "$PW_GOLDEN_DIR" && return 0
+  local legacy="$PW_CACHE_DIR/profile"
+  dir_has_content "$legacy" || return 0
+  [[ -n "$(profile_browser_pids "$legacy")" ]] && return 0
+  local staging="${PW_GOLDEN_DIR}.bootstrap.$$"
+  rm -rf "$staging" 2>/dev/null || true
+  mkdir -p "$(dirname "$PW_GOLDEN_DIR")" 2>/dev/null || return 0
+  if ! copy_profile "$legacy" "$staging"; then
+    rm -rf "$staging" 2>/dev/null || true
+    return 0
+  fi
+  # golden is absent or empty here, but an empty dir would make mv nest inside it.
+  rm -rf "$PW_GOLDEN_DIR" 2>/dev/null || true
+  if mv "$staging" "$PW_GOLDEN_DIR" 2>/dev/null; then
+    echo "pw: adopted the previous shared profile as the golden seed ($PW_GOLDEN_DIR)." >&2
+  else
+    rm -rf "$staging" 2>/dev/null || true
+  fi
+  return 0
+}
+
+# Copy the golden profile into this session's empty profile dir, so a brand-new
+# isolated session inherits existing logins instead of starting logged out.
+# Only ever runs when this session has no profile yet, so it cannot clobber
+# state a session already built up. The golden dir is never launched against,
+# so the copy is always taken from a quiescent profile.
+seed_profile_from_golden() {
+  [[ "$PW_ISOLATED" == "1" ]]   || return 0
+  [[ "$PW_SEED" == "1" ]]       || return 0
+  [[ "$PW_EPHEMERAL" == "1" ]] && return 0
+  [[ -e "$PW_STATE_DIR/no-seed" ]] && return 0
+  dir_has_content "$PW_PROFILE_DIR" && return 0
+  bootstrap_golden_from_legacy
+  dir_has_content "$PW_GOLDEN_DIR"  || return 0
+  local staging="${PW_PROFILE_DIR}.seeding.$$"
+  mkdir -p "$(dirname "$PW_PROFILE_DIR")" 2>/dev/null || return 0
+  rm -rf "$staging" 2>/dev/null || true
+  # Stage then rename: an interrupted copy must not leave a half profile behind
+  # that the next launch mistakes for an already-seeded one.
+  if ! copy_profile "$PW_GOLDEN_DIR" "$staging"; then
+    rm -rf "$staging" 2>/dev/null || true
+    echo "pw: could not seed from $PW_GOLDEN_DIR — starting logged out." >&2
+    return 0
+  fi
+  rm -rf "$PW_PROFILE_DIR" 2>/dev/null || true
+  if mv "$staging" "$PW_PROFILE_DIR" 2>/dev/null; then
+    echo "pw: seeded this session's profile from $PW_GOLDEN_DIR (saved logins carried over)." >&2
+  else
+    rm -rf "$staging" 2>/dev/null || true
+  fi
+  return 0
 }
 
 # Populate PROFILE_ARGS with the flags that pin a fresh launch to the persistent
@@ -93,6 +282,7 @@ profile_browser_pids() {
 profile_launch_args() {
   PROFILE_ARGS=()
   [[ "$PW_EPHEMERAL" == "1" ]] && return 0
+  seed_profile_from_golden
   mkdir -p "$PW_PROFILE_DIR" || die "cannot create profile dir: $PW_PROFILE_DIR"
   # Playwright teardown kills Chrome before it writes its clean-exit marker, so
   # every relaunch of the persistent profile shows the "Restore pages?" crash
@@ -179,6 +369,40 @@ kill_profile_browsers() {
   return 0
 }
 
+# Reap abandoned per-session profiles. Without this, ~/.cache/pw-cli/sessions/
+# grows by one full Chromium profile per session forever.
+# A session dir is removed only when ALL of these hold:
+#   - it is not this session's;
+#   - no live browser holds its profile (never delete a profile still in use);
+#   - its playwright session is not open in the registry;
+#   - it has gone unused for PW_SESSION_TTL_DAYS.
+# Deliberately verbose only when it actually removes something.
+sweep_stale_sessions() {
+  local root="$PW_CACHE_DIR/sessions"
+  [[ -d "$root" ]] || return 0
+  local listing now d key stamp age removed=0
+  listing="$("$PW_BIN" list 2>/dev/null || true)"
+  now="$(date +%s)"
+  for d in "$root"/*; do
+    [[ -d "$d" ]] || continue
+    key="$(basename "$d")"
+    if [[ "$key" == "$PW_SESSION_KEY" ]]; then continue; fi
+    if [[ -n "$(profile_browser_pids "$d/profile")" ]]; then continue; fi
+    if printf '%s\n' "$listing" | grep -q "^- pw-${key}:"; then continue; fi
+    stamp="$(cat "$d/last-used" 2>/dev/null || true)"
+    case "$stamp" in
+      ''|*[!0-9]*) stamp="$(stat -f %m "$d" 2>/dev/null || echo "$now")" ;;
+    esac
+    age=$(( (now - stamp) / 86400 ))
+    if [[ "$age" -lt "$PW_SESSION_TTL_DAYS" ]]; then continue; fi
+    if rm -rf "$d" 2>/dev/null; then removed=$(( removed + 1 )); fi
+  done
+  if [[ "$removed" -gt 0 ]]; then
+    echo "pw: reaped $removed stale session profile(s) (unused > ${PW_SESSION_TTL_DAYS}d) from $root" >&2
+  fi
+  return 0
+}
+
 # Close the session (capturing its current URL) and relaunch on the same
 # persistent profile with the given headless mode. Logins survive on disk;
 # the page is restored. This is how show/hide "switch" modes — a running
@@ -225,29 +449,38 @@ case "$cmd" in
     [[ "$PW_EPHEMERAL" == "1" ]] && profile_mode="ephemeral (in-memory)"
     pw_mode="headless (invisible)"
     [[ "$PLAYWRIGHT_MCP_HEADLESS" == "false" ]] && pw_mode="headed (visible)"
+    scope="isolated to this agent session"
+    [[ "$PW_ISOLATED" == "1" ]] || scope="shared (no CLAUDE_CODE_SESSION_ID, or PW_PROFILE_DIR set)"
     cat <<EOF
-pw — browser wrapper (one reusable session '${PW_SESSION}'; currently ${pw_mode}; artifacts in ${PW_SCRATCH_DIR})
+pw — browser wrapper (session '${PW_SESSION}', ${scope}; currently ${pw_mode}; artifacts in ${PW_SCRATCH_DIR})
 
-Sessions are REUSED: 'pw open URL' navigates the existing browser instead of
-launching a new one. The browser uses a ${profile_mode} profile, so you log in
-(and pass 2FA) once and it sticks across launches and tasks. The browser is
+One browser per agent session, reused across tasks: 'pw open URL' navigates this
+session's existing browser instead of launching a new one, and never touches
+another session's window. The browser uses a ${profile_mode} profile,
+so a login (and 2FA) sticks for the rest of this session and across resumes of
+it. A brand-new session is seeded from the golden profile if one exists
+(${PW_GOLDEN_DIR}) — 'pw promote' saves the current logins there. The browser is
 visible (headed) by default; 'pw hide' makes it invisible for background work,
 'pw show' brings it back — both keep the profile and current page.
 
 Wrapper verbs:
-  pw open URL   open (or reuse) the session and navigate
+  pw open URL   open (or reuse) this session's browser and navigate
   pw show       make the browser visible (relaunch headed; logins + page survive)
   pw hide       make the browser invisible again (relaunch headless)
-  pw status     sessions, mode, last-used, orphan warnings
-  pw gc         reap orphaned profile browsers + clear stale locks
+  pw status     this session's name, profile, mode, last-used, orphan warnings
+  pw gc         reap this session's orphaned browsers + stale locks + old profiles
   pw fresh URL  force a NEW browser (close current, relaunch) — rare; only when needed
-  pw forget     clear the saved login (close + delete the persistent profile)
+  pw promote    save this session's logins as the golden seed for new sessions
+  pw forget     clear the saved login (close + delete this session's profile)
   pw end        close the '${PW_SESSION}' session (saved login persists on disk)
-  pw nuke       close-all + kill-all + kill profile browsers + wipe scratch dir
+  pw nuke       reset THIS session (add --all to kill every session's browser)
   pw selftest   verify session mode + no repo litter
   pw help       this help
 
-Env: PW_EPHEMERAL=1 (throwaway in-memory profile), PW_PROFILE_DIR (profile path),
+Env: PW_EPHEMERAL=1 (throwaway in-memory profile), PW_PROFILE_DIR (explicit
+profile path — opts back into sharing one profile across sessions), PW_SEED=0
+(do not seed new sessions from the golden profile), PW_GOLDEN_DIR,
+PW_SESSION_TTL_DAYS (default ${PW_SESSION_TTL_DAYS}),
 PLAYWRIGHT_MCP_HEADLESS=true|false (one-off mode override).
 All other commands pass through to playwright-cli, scoped to '${PW_SESSION}'.
 playwright-cli's own help follows:
@@ -256,6 +489,20 @@ EOF
     ;;
   status)
     "$PW_BIN" list || true
+    # `list` is global — it shows every session on the machine, including other
+    # agents'. Name ours explicitly so nobody reads another session's row as
+    # their own; that confusion is the whole reason isolation exists.
+    if [[ "$PW_ISOLATED" == "1" ]]; then
+      echo "pw: this session: '${PW_SESSION}' (isolated; other rows above belong to other sessions)"
+    else
+      echo "pw: this session: '${PW_SESSION}' (SHARED profile — other sessions can drive this browser)"
+    fi
+    echo "pw: profile: $PW_PROFILE_DIR"
+    if session_running; then
+      echo "pw: state: open"
+    else
+      echo "pw: state: not open ('pw open URL' to launch)"
+    fi
     pw_mode="headless"; [[ "$PLAYWRIGHT_MCP_HEADLESS" == "false" ]] && pw_mode="headed"
     echo "pw: default mode: $pw_mode ('pw show' / 'pw hide' to switch)"
     if [[ -f "$PW_STATE_DIR/last-used" ]]; then
@@ -299,11 +546,65 @@ EOF
     relaunch_with_mode true
     ;;
   gc)
+    # Reaping is scoped to THIS session's profile dir, so gc can never kill a
+    # browser belonging to another session — the previous shared-profile
+    # version did exactly that.
     if session_running; then
       echo "pw: session '${PW_SESSION}' is open and tracked — nothing to clean ('pw end' closes it)."
     else
       kill_profile_browsers
-      echo "pw: cleaned up — orphaned profile browsers reaped, stale locks cleared."
+      echo "pw: cleaned up '${PW_SESSION}' — orphaned profile browsers reaped, stale locks cleared."
+    fi
+    sweep_stale_sessions
+    ;;
+  promote)
+    # Save this session's logins as the seed for future sessions. Copying a
+    # profile Chromium is still writing produces a torn sqlite cookie DB, so
+    # refuse while a browser holds it rather than shipping a corrupt golden.
+    [[ "$PW_EPHEMERAL" == "1" ]] && die "PW_EPHEMERAL=1 — there is no on-disk profile to promote."
+    dir_has_content "$PW_PROFILE_DIR" || die "no profile at $PW_PROFILE_DIR yet — open a browser and log in first."
+    if session_running || [[ -n "$(profile_browser_pids)" ]]; then
+      die "browser still running on this profile. Run 'pw end' first, then 'pw promote' (copying a live profile corrupts the cookie DB)."
+    fi
+    golden_staging="${PW_GOLDEN_DIR}.promoting.$$"
+    rm -rf "$golden_staging" 2>/dev/null || true
+    mkdir -p "$(dirname "$PW_GOLDEN_DIR")" || die "cannot create $(dirname "$PW_GOLDEN_DIR")"
+    copy_profile "$PW_PROFILE_DIR" "$golden_staging" \
+      || { rm -rf "$golden_staging"; die "copy failed"; }
+    rm -rf "${PW_GOLDEN_DIR}.old" 2>/dev/null || true
+    [[ -d "$PW_GOLDEN_DIR" ]] && mv "$PW_GOLDEN_DIR" "${PW_GOLDEN_DIR}.old"
+    # If the swap-in fails we have already moved the old golden aside, so put it
+    # back. Failing here without restoring would destroy the saved logins of
+    # every future session, which is far worse than a failed promote.
+    if ! mv "$golden_staging" "$PW_GOLDEN_DIR" 2>/dev/null; then
+      rm -rf "$golden_staging" 2>/dev/null || true
+      [[ -d "${PW_GOLDEN_DIR}.old" ]] && mv "${PW_GOLDEN_DIR}.old" "$PW_GOLDEN_DIR"
+      die "could not install golden profile (previous golden restored)"
+    fi
+    rm -rf "${PW_GOLDEN_DIR}.old" 2>/dev/null || true
+    echo "pw: promoted this session's logins to the golden profile ($PW_GOLDEN_DIR)."
+    echo "pw: new sessions will start from it. 'PW_SEED=0' opts out; 'pw forget --golden' clears it."
+    # Chromium batches cookie writes on a ~30s timer and Playwright hard-kills
+    # the browser on teardown, so a login completed seconds before 'pw end' can
+    # still be in memory only and never reach disk. Promoting then copies a
+    # profile with no cookies — silently useless. Say so instead.
+    if ! python3 - "$PW_GOLDEN_DIR/Default/Cookies" <<'PYEOF'
+import sqlite3, sys, os, shutil, tempfile
+src = sys.argv[1]
+if not os.path.exists(src):
+    sys.exit(1)
+tmp = os.path.join(tempfile.mkdtemp(), "Cookies")
+shutil.copy(src, tmp)
+try:
+    n = sqlite3.connect(tmp).execute("select count(*) from cookies").fetchone()[0]
+except Exception:
+    sys.exit(1)
+sys.exit(0 if n > 0 else 1)
+PYEOF
+    then
+      echo "pw: WARNING: the promoted profile has no stored cookies." >&2
+      echo "pw: Chromium flushes cookies to disk on a ~30s timer; a login closed sooner is lost." >&2
+      echo "pw: leave the browser open ~a minute after logging in, then 'pw end' and 'pw promote'." >&2
     fi
     ;;
   end)
@@ -324,17 +625,42 @@ EOF
     exec "$PW_BIN" -s="$PW_SESSION" open --browser "$PW_BROWSER" ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"} "$@"
     ;;
   forget|logout)
+    shift || true
     "$PW_BIN" -s="$PW_SESSION" close >/dev/null 2>&1 || true
     kill_profile_browsers
     rm -rf "$PW_PROFILE_DIR"
+    # Without this marker the next 'pw open' would silently re-seed from the
+    # golden profile and land logged back in — the opposite of what forget says.
+    mkdir -p "$PW_STATE_DIR" 2>/dev/null || true
+    : > "$PW_STATE_DIR/no-seed" 2>/dev/null || true
     echo "pw: cleared saved login ($PW_PROFILE_DIR). Next 'pw open' starts logged-out."
+    if [[ "${1:-}" == "--golden" ]]; then
+      rm -rf "$PW_GOLDEN_DIR"
+      echo "pw: also cleared the golden profile ($PW_GOLDEN_DIR) — new sessions start logged-out too."
+    elif dir_has_content "$PW_GOLDEN_DIR"; then
+      echo "pw: the golden profile still holds logins for NEW sessions ('pw forget --golden' clears it too)."
+    fi
     ;;
   nuke)
-    "$PW_BIN" close-all >/dev/null 2>&1 || true
-    "$PW_BIN" kill-all  >/dev/null 2>&1 || true
-    kill_profile_browsers
-    rm -rf "$PW_SCRATCH_DIR"
-    echo "pw: reset (sessions killed, profile browsers killed, scratch wiped: $PW_SCRATCH_DIR; login profile kept: $PW_PROFILE_DIR — 'pw forget' to clear it)"
+    shift || true
+    if [[ "${1:-}" == "--all" ]]; then
+      # Global escape hatch: kills every session's browser on this machine,
+      # including other agents'. Only reachable by asking for it explicitly.
+      "$PW_BIN" close-all >/dev/null 2>&1 || true
+      "$PW_BIN" kill-all  >/dev/null 2>&1 || true
+      kill_profile_browsers
+      rm -rf "$PW_SCRATCH_DIR"
+      echo "pw: reset ALL sessions (every session's browser killed, scratch wiped: $PW_SCRATCH_DIR; login profiles kept)"
+    else
+      # Scoped by default. close-all/kill-all and wiping the shared scratch dir
+      # are machine-wide and would take out other sessions' browsers and
+      # artifacts, which is the failure mode this whole design exists to stop.
+      "$PW_BIN" -s="$PW_SESSION" close >/dev/null 2>&1 || true
+      kill_profile_browsers
+      sweep_stale_sessions
+      echo "pw: reset '${PW_SESSION}' (its browser killed; login profile kept: $PW_PROFILE_DIR — 'pw forget' to clear it)"
+      echo "pw: other sessions and $PW_SCRATCH_DIR left alone ('pw nuke --all' for the machine-wide reset)"
+    fi
     ;;
   selftest)
     tmp="$(mktemp -d)"; rc=0
@@ -400,10 +726,15 @@ EOF
         echo "pw: session '${PW_SESSION}' already open (reusing). 'pw status' to inspect; 'pw fresh URL' to force a new browser."
       fi
     else
-      # No live session in the registry, so any process still holding the
+      # No live session under OUR name, so any process still holding OUR
       # profile is an orphan that would fail the launch with "Browser is
       # already in use". Reap it first — this makes open self-healing.
+      # kill_profile_browsers is scoped to PW_PROFILE_DIR, which is unique to
+      # this session, so it can never reap another session's live browser.
       kill_profile_browsers
+      # Only on the slow path (we are launching anyway), so it costs nothing
+      # on the common reuse path.
+      sweep_stale_sessions
       profile_launch_args
       clear_session_cache
       "$PW_BIN" -s="$PW_SESSION" open --browser "$PW_BROWSER" ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"} "$@" || { kill_profile_browsers; die "open failed — profile browsers killed, lock cleared. Re-run pw open."; }
