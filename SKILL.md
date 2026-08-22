@@ -35,8 +35,11 @@ report confident nonsense about it.
   and session names resolve globally, so a raw `playwright-cli -s=pw ...` can
   attach to a different session's browser and steer it.
 - `pw open <url>` navigates your existing browser. It does not open a second
-  one. To visit another URL, run `pw open <url>` again. If no browser is running
-  it launches one, reaping your own stale orphans first (self-healing).
+  one, and it does not close and reopen the one you have — that is what raw
+  `playwright-cli open` does, and `pw` exists partly to keep it away from a
+  running browser. Use it for every URL, including the tenth in a row. If no
+  browser is running it launches one, reaping your own stale orphans first
+  (self-healing), and says so on stderr; silence means it navigated in place.
 - Do not call `pw end` between steps within a task. That throws away the
   session. Only consider it when the whole task is finished (see Finishing up).
 - `pw fresh <url>` is rare: only for a clean slate (switching accounts,
@@ -61,16 +64,20 @@ modes when needed:
 
 Both keep logins and the current page; the relaunch takes a few seconds.
 
-## After the human confirms login — NEVER call pw open again
+## After the human confirms login — snapshot before you navigate
 
 When a human says "logged in" or "done" after completing an auth flow:
 
-1. Run `pw snapshot` ONLY — do NOT call `pw open <url>` again.
-2. `pw open` kills the current browser and relaunches, wiping the session the human just created.
-3. If the snapshot confirms you're past the auth wall, navigate with `pw eval "location.href = 'url'"` or `pw click` — never `pw open`.
+1. Run `pw snapshot` ONLY. Do not navigate anywhere yet.
+2. A site finishes an auth flow with redirects and token exchanges of its own.
+   Navigating on top of an unfinished one aborts it and drops you back at the
+   login page, so let the snapshot tell you where you actually are.
+3. Once the snapshot confirms you are past the auth wall, go wherever you need
+   with `pw open <url>`. It navigates the browser you already have and keeps the
+   login (see Session discipline).
 4. If the snapshot still shows a login page, tell the human and wait again.
 
-This is the most common failure mode. Burn it in: **after login confirmed → `pw snapshot`, never `pw open`**.
+Burn it in: **after login confirmed → `pw snapshot` first, navigate second.**
 
 ## How long a login lasts
 
@@ -110,7 +117,8 @@ asked for:
 3. **Hand off to the human.** Say something like: "Jira is showing a login
    screen in the browser window — please sign in there, then tell me to
    continue."
-4. **Wait** for the human to confirm, then `pw snapshot` to verify — never `pw open`.
+4. **Wait** for the human to confirm, then `pw snapshot` to verify before you
+   navigate anywhere.
 
 Because the profile persists, this happens at most once per site per session,
 and not at all for sites already saved in the golden profile. When it does
@@ -122,10 +130,12 @@ happen, `pw promote` afterwards spares every future session the same prompt.
 - call `playwright-cli` directly instead of `pw`;
 - act on a `playwright-cli list` row that is not the session `pw status` names;
 - run `pw nuke --all` without being asked for a machine-wide reset;
-- open a fresh browser for each URL instead of reusing the running session;
+- reach for `pw fresh` or raw `playwright-cli open` to visit a URL, instead of
+  plain `pw open <url>`, which reuses the browser you already have;
 - call `pw end` in the middle of a task;
 - run `pw promote` before the browser is closed, or seconds after a login;
-- **call `pw open <url>` after the human says they logged in** — snapshot first, navigate with eval or click;
+- **navigate anywhere the moment the human says they logged in** — snapshot
+  first, then go;
 - proceed after a snapshot shows "Sign in", "Log in", "Enter password",
   "Verify", "two-factor", "authenticator", or an Okta / SSO / Microsoft /
   Google login screen;
@@ -139,7 +149,11 @@ happen, `pw promote` afterwards spares every future session the same prompt.
   `--isolated`** — it runs on a throwaway copy of the profile and silently
   discards every login from that run.
 - **Never fall back to raw `playwright-cli open`** — that uses an in-memory
-  profile; logins made there are lost.
+  profile (logins made there are lost) and it stops and relaunches the daemon
+  every time, so it throws away the page and session you already had.
+- **"cannot tell whether your browser is running"**: `playwright-cli list` failed
+  twice, so `pw` refused to act rather than relaunch over a browser that may be
+  alive and working. Re-run the same command; if it keeps happening, `pw status`.
 - `pw status` names your session and profile, then shows mode, last-used time,
   and orphan warnings. The `playwright-cli list` block above that is
   machine-wide; other agents' sessions are not yours to act on.
