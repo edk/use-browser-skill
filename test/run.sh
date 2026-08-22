@@ -271,6 +271,51 @@ if kill -0 "$HEAL_PID" 2>/dev/null; then
 else echo "ok: open reaped orphan before launching"; PASS=$((PASS+1)); fi
 wait "$HEAL_PID" 2>/dev/null
 
+# --- open: never destroys a browser it cannot see ---
+# Deciding the session is closed is what licenses open to KILL whatever Chrome
+# still holds the profile. A `playwright-cli list` that failed to run looks
+# exactly like one that found nothing, so reading a failed list as "closed"
+# reaped a live browser mid-task — and with it any login whose cookies Chromium
+# had not yet flushed. When the state cannot be read, open must refuse.
+BLIND_PROF="$(mktemp -d)/profile"; mkdir -p "$BLIND_PROF"
+bash -c 'sleep 300; true' "--user-data-dir=$BLIND_PROF" >/dev/null 2>&1 &
+BLIND_PID=$!
+REC="$(mktemp)"
+PATH="$STUB_DIR:$PATH" STUB_RECORD="$REC" STUB_LIST_RC=3 \
+  PW_PROFILE_DIR="$BLIND_PROF" PW_SCRATCH_DIR="$(mktemp -d)" \
+  "$PW" open http://blind >/tmp/pw_out 2>/tmp/pw_err
+RC=$?
+assert_rc 2 "open refuses when the session state cannot be read"
+assert_not_contains "$REC" "-s=pw open --browser" "open does not relaunch on an unreadable list"
+assert_not_contains "$REC" "-s=pw goto" "open does not navigate a session it cannot see"
+assert_contains /tmp/pw_err "cannot tell" "open says why it refused"
+if kill -0 "$BLIND_PID" 2>/dev/null; then
+  echo "ok: open left the live browser alone when list failed"; PASS=$((PASS+1))
+else echo "FAIL: open killed a browser it could not see"; FAIL=$((FAIL+1)); fi
+kill -9 "$BLIND_PID" 2>/dev/null; wait "$BLIND_PID" 2>/dev/null
+
+# A single failed list is a daemon caught mid-restart, not a dead session: one
+# retry must recover it and take the reuse path.
+REC="$(mktemp)"
+PATH="$STUB_DIR:$PATH" STUB_RECORD="$REC" STUB_LIST_FAIL_ONCE="$(mktemp -u)" \
+  STUB_SESSIONS='### Browsers\n- pw:\n  - status: open\n  - browser-type: chrome\n  - user-data-dir: <in-memory>\n  - headed: true\n' \
+  PW_PROFILE_DIR="$(mktemp -d)/profile" PW_SCRATCH_DIR="$(mktemp -d)" \
+  "$PW" open http://retry >/dev/null 2>&1
+assert_contains "$REC" "-s=pw goto http://retry" "open retries a failed list and then reuses"
+assert_not_contains "$REC" "-s=pw open --browser" "open does not relaunch after a recovered list"
+
+# gc makes the same kill decision, so it needs the same guard.
+GCB_PROF="$(mktemp -d)/profile"; mkdir -p "$GCB_PROF"
+bash -c 'sleep 300; true' "--user-data-dir=$GCB_PROF" >/dev/null 2>&1 &
+GCB_PID=$!
+PATH="$STUB_DIR:$PATH" STUB_RECORD="$(mktemp)" STUB_LIST_RC=3 \
+  PW_PROFILE_DIR="$GCB_PROF" PW_SCRATCH_DIR="$(mktemp -d)" \
+  "$PW" gc >/dev/null 2>&1
+if kill -0 "$GCB_PID" 2>/dev/null; then
+  echo "ok: gc left the live browser alone when list failed"; PASS=$((PASS+1))
+else echo "FAIL: gc killed a browser it could not see"; FAIL=$((FAIL+1)); fi
+kill -9 "$GCB_PID" 2>/dev/null; wait "$GCB_PID" 2>/dev/null
+
 # --- per-session isolation: name + profile derivation ---
 # Every case below runs WITHOUT the suite-wide PW_PROFILE_DIR export, because
 # an explicit profile is itself the opt-out from isolation.

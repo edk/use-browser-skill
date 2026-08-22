@@ -110,18 +110,47 @@ esac
 # context, regardless of where the user invoked pw from.
 cd "$PW_SCRATCH_DIR"
 
-# Check that the named session exists AND has status: open.
-# Plain grep on the session name is not sufficient — closed sessions remain in
-# `playwright-cli list` output under "Browser servers available for attach",
-# causing false positives that send `pw open` to `goto` against a dead session.
+# Classify this session: "open", "closed", or "unknown".
+#
+# Checking that the named session exists AND has status: open — rather than
+# grepping for the name — is what keeps a closed session (they linger in `list`
+# under "Browser servers available for attach") from sending `pw open` to `goto`
+# against a dead browser.
+#
+# "unknown" is the other half. Concluding "closed" is what licenses `open` and
+# `gc` to KILL whatever Chrome still holds the profile, and a `list` that failed
+# to run is indistinguishable from a `list` that found nothing. Treating a failed
+# call as "closed" reaps a live browser mid-task; because Chromium batches cookie
+# writes on a ~30s timer, that can take a login the human just completed with it.
+# One retry absorbs a daemon caught mid-restart; past that, report unknown and
+# let the caller refuse rather than guess. Empty stdout counts as failure: the
+# real CLI prints "  (no browsers)" for an empty registry, never nothing at all.
 # NB: an exit in an awk END block overrides any exit code set in the body, so
 # the verdict must be carried into END via a flag, not exited early.
-session_running() {
-  "$PW_BIN" list 2>/dev/null | awk \
-    -v s="^- ${PW_SESSION}:" \
-    '$0 ~ s {found=1; next} found && /status: open/ {ok=1; exit} found && /^-/ {exit} END {exit ok ? 0 : 1}' \
-    2>/dev/null
+session_state() {
+  # Every branch here must end on a true command: a bare `[[ ... ]] && cmd`
+  # whose test fails returns 1, and under `set -e` that kills the shell mid-check
+  # (in a command substitution it dies silently and yields an empty verdict).
+  local out rc i
+  for i in 1 2; do
+    if out="$("$PW_BIN" list 2>/dev/null)"; then rc=0; else rc=$?; fi
+    if [[ $rc -eq 0 && -n "$out" ]]; then break; fi
+    if [[ $i -eq 1 ]]; then sleep 0.3; fi
+  done
+  if [[ $rc -ne 0 || -z "$out" ]]; then printf 'unknown\n'; return 0; fi
+  if printf '%s\n' "$out" | awk \
+      -v s="^- ${PW_SESSION}:" \
+      '$0 ~ s {found=1; next} found && /status: open/ {ok=1; exit} found && /^-/ {exit} END {exit ok ? 0 : 1}' \
+      2>/dev/null; then
+    printf 'open\n'
+  else
+    printf 'closed\n'
+  fi
 }
+
+# True only when the session is confirmed open. Callers that go on to kill
+# something must use session_state and handle "unknown" explicitly.
+session_running() { [[ "$(session_state)" == "open" ]]; }
 
 # Exit 0 if the open session is headed (visible), 1 if headless or absent.
 session_headed() {
@@ -350,8 +379,12 @@ kill_profile_browsers() {
   pids="$(profile_browser_pids)"
   if [[ -n "$pids" ]]; then
     for pid in $pids; do kill "$pid" 2>/dev/null || true; done
-    # Give Chrome a moment to flush the profile and exit; force-kill stragglers.
-    for i in 1 2 3 4 5 6 7 8 9 10; do
+    # Give Chrome time to flush the profile and exit before forcing it. The
+    # window is 5s rather than a token 2s because Chromium batches cookie writes
+    # on a ~30s timer: SIGTERM makes it flush, SIGKILL does not, so cutting the
+    # wait short is how a login completed moments ago never reaches disk. The
+    # loop exits as soon as everything is gone, so a clean shutdown pays nothing.
+    for i in $(seq 1 25); do
       alive=""
       for pid in $pids; do kill -0 "$pid" 2>/dev/null && alive=1 || true; done
       [[ -z "$alive" ]] && break
@@ -549,12 +582,17 @@ EOF
     # Reaping is scoped to THIS session's profile dir, so gc can never kill a
     # browser belonging to another session — the previous shared-profile
     # version did exactly that.
-    if session_running; then
-      echo "pw: session '${PW_SESSION}' is open and tracked — nothing to clean ('pw end' closes it)."
-    else
-      kill_profile_browsers
-      echo "pw: cleaned up '${PW_SESSION}' — orphaned profile browsers reaped, stale locks cleared."
-    fi
+    case "$(session_state)" in
+      open)
+        echo "pw: session '${PW_SESSION}' is open and tracked — nothing to clean ('pw end' closes it)." ;;
+      unknown)
+        # Same kill decision as open, so the same guard: never reap on the
+        # strength of a list that did not run.
+        die "cannot tell whether your browser is running — '$PW_BIN list' failed twice. Refusing to reap, which could kill a live browser. Retry in a moment." ;;
+      *)
+        kill_profile_browsers
+        echo "pw: cleaned up '${PW_SESSION}' — orphaned profile browsers reaped, stale locks cleared." ;;
+    esac
     sweep_stale_sessions
     ;;
   promote)
@@ -719,18 +757,35 @@ PYEOF
           die "refusing download URL '$arg' — use the regular page URL instead (see skill docs)" ;;
       esac
     done
-    if session_running; then
+    # `open URL` on a live session NAVIGATES it. It never closes and reopens the
+    # browser: raw `playwright-cli open` always stops the daemon and starts a new
+    # one, and this branch exists to keep that away from a browser that is
+    # already up (and away from the page state, and the login, it is holding).
+    case "$(session_state)" in
+    open)
       if [[ $# -gt 0 ]]; then
         "$PW_BIN" -s="$PW_SESSION" goto "$@" || { kill_profile_browsers; die "goto failed — profile browsers killed, lock cleared. Re-run pw open."; }
       else
         echo "pw: session '${PW_SESSION}' already open (reusing). 'pw status' to inspect; 'pw fresh URL' to force a new browser."
       fi
-    else
+      ;;
+    unknown)
+      # Relaunching from here would kill a browser that may well be alive and
+      # working, so refuse instead of guessing. See session_state.
+      die "cannot tell whether your browser is running — '$PW_BIN list' failed twice. Refusing to relaunch, which would kill a live browser and any login it is holding. Retry in a moment, or run 'pw status'."
+      ;;
+    *)
       # No live session under OUR name, so any process still holding OUR
       # profile is an orphan that would fail the launch with "Browser is
       # already in use". Reap it first — this makes open self-healing.
       # kill_profile_browsers is scoped to PW_PROFILE_DIR, which is unique to
       # this session, so it can never reap another session's live browser.
+      # Say so when it happens: this is the one path where a window really does
+      # disappear and come back, and a silent one reads as "open restarts the
+      # browser every time", which it does not.
+      if [[ -n "$(profile_browser_pids)" ]]; then
+        echo "pw: no live session for '${PW_SESSION}' — reaping the orphaned browser still holding your profile, then launching a new one." >&2
+      fi
       kill_profile_browsers
       # Only on the slow path (we are launching anyway), so it costs nothing
       # on the common reuse path.
@@ -738,7 +793,8 @@ PYEOF
       profile_launch_args
       clear_session_cache
       "$PW_BIN" -s="$PW_SESSION" open --browser "$PW_BROWSER" ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"} "$@" || { kill_profile_browsers; die "open failed — profile browsers killed, lock cleared. Re-run pw open."; }
-    fi
+      ;;
+    esac
     ;;
   *)
     exec "$PW_BIN" -s="$PW_SESSION" "$@"

@@ -7,7 +7,21 @@
 } >> "${STUB_RECORD:-/dev/null}"
 case "${1:-}" in
   --help) echo "stub: playwright-cli help" ;;
-  list)   printf '%b' "${STUB_SESSIONS:-}" ;;
+  list)
+    # STUB_LIST_FAIL_ONCE=<path>: fail the first call only, succeed after
+    # (models a daemon caught mid-restart). STUB_LIST_RC=<n>: fail every call.
+    if [[ -n "${STUB_LIST_FAIL_ONCE:-}" && ! -f "$STUB_LIST_FAIL_ONCE" ]]; then
+      : > "$STUB_LIST_FAIL_ONCE"
+      echo "stub: list unavailable" >&2
+      exit 3
+    fi
+    if [[ -n "${STUB_LIST_RC:-}" && "${STUB_LIST_RC}" != "0" ]]; then
+      echo "stub: list unavailable" >&2
+      exit "$STUB_LIST_RC"
+    fi
+    # The real CLI prints "  (no browsers)" for an empty registry, never
+    # nothing at all — empty stdout means the call itself broke.
+    printf '%b' "${STUB_SESSIONS:-  (no browsers)\n}" ;;
 esac
 case " $* " in
   *" eval "*) printf '%s\n' "${STUB_EVAL:-}" ;;
