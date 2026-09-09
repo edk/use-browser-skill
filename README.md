@@ -110,3 +110,110 @@ Two separate things can pin CPU on macOS:
   client disappears (known macOS bug, not specific to pw). Fix:
   `killall replayd` — it is an on-demand daemon and relaunches cleanly.
   Headless mode avoids most SCK involvement in the first place.
+
+## pwx: the in-development Node port
+
+This repo also contains `pwx`, a Node rewrite of `pw` living in `bin/pwx.js`
+and `lib/`. It adds Firefox alongside Chromium and support for Ubuntu Linux
+and native Windows 10, on top of everything `pw` already does. It does not
+touch `bin/pw` or `install.sh`; installing or running `pwx` cannot affect
+the `pw` command described above.
+
+### Requirements
+
+Node 20 or later. This is `pwx`'s own floor, declared in its
+`package.json` under `engines`; it is higher than the Node 18 that
+`@playwright/cli` itself requires.
+
+### Install from a clone
+
+The same steps work on macOS, Ubuntu, and Windows 10:
+
+```bash
+git clone https://github.com/edk/use-browser-skill.git
+cd use-browser-skill
+npm install
+node node_modules/@playwright/cli/playwright-cli.js install-browser chromium --with-deps
+node node_modules/@playwright/cli/playwright-cli.js install-browser firefox --with-deps
+npm install -g .
+pwx selftest
+```
+
+`npm install -g .` reads the `bin` entry in `package.json` and puts a `pwx`
+command on PATH: a symlink on macOS and Ubuntu, an npm-generated `pwx.cmd`
+shim on Windows. Run it from the shell you plan to drive `pwx` from later
+(PowerShell or the Git Bash Claude Code uses on Windows); npm resolves the
+right shim on PATH either way. `--with-deps` also installs the Linux
+system packages each browser needs; on Ubuntu this step may prompt for
+`sudo`.
+
+### pwx versus pw during development
+
+`pwx` and `pw` are separate commands with separate state, so running one
+cannot disturb a login, profile, or browser session that belongs to the
+other. `pw` keeps its state under `~/.cache/pw-cli`; `pwx` keeps its state
+under `~/.cache/pwx`, an entirely different directory, and never reads or
+writes anything under `~/.cache/pw-cli`. The same separation holds for
+scratch and artifact directories. This lasts through development; a later
+cutover step, not part of this port, renames `pwx` to `pw` and moves it
+onto `pw`'s state paths.
+
+`pwx` reads `PW_STATE_ROOT` and deliberately ignores `PW_CACHE_DIR`, which
+is `pw`'s own state-root override. Honouring both would have made that
+separation untrue for anyone with `PW_CACHE_DIR` exported: `pwx` would
+migrate `pw`'s golden profile into the new layout and then reap `pw`'s live
+browser as an orphan. To point `pwx` somewhere else, set `PW_STATE_ROOT`.
+
+### Where pwx state lives
+
+State root: `~/.cache/pwx` (override with `PW_STATE_ROOT`, or `stateDir` in
+the config file). Directories `pwx` creates are owner-only: the storage-state
+snapshot beside each profile holds session cookies in plaintext, unlike
+Chromium's own keychain-encrypted cookie store.
+
+```
+config.json          machine defaults: browser, headed, stateDir
+golden/chromium/      seed profile for new Chromium sessions
+golden/firefox/       seed profile for new Firefox sessions
+sessions/<key>/       one directory per agent session
+  profile/            that session's live browser profile
+  browser              which browser this session recorded at open
+  mode                 headed or headless
+  last-used            epoch seconds, used by pwx gc
+profile/              legacy shared profile when there is no session id
+```
+
+Scratch and artifacts (screenshots, traces, and similar) go to a `pwx`
+subdirectory under the operating system's temp directory, never into a
+repo, separately from `pw`'s own scratch directory.
+
+### Running the test suites
+
+```bash
+npm test                                    # unit tests
+PWX_INTEGRATION=1 npm run test:integration  # integration tests
+```
+
+`npm test` runs the unit suite in `test/unit` against a stub
+`playwright-cli` and needs no real browser. The integration suite in
+`test/integration` drives real headless Chromium and Firefox sessions
+against a local HTTP server; it is gated behind `PWX_INTEGRATION=1` so it
+never runs by accident, and it needs both browsers installed first with
+the `install-browser` commands shown above, or it fails outright.
+
+### How promote survives an immediate end
+
+`pw` (the bash tool) relies on Chromium's own on-disk cookie flush, on a
+roughly 30 second timer, to have a login on disk by the time `pw promote`
+copies the profile; that is why the advice above says to wait a minute
+after logging in before `pw end`. `pwx` removes that wait: before `pwx
+end` closes the browser, it captures the browser's live storage state and
+carries it alongside the profile through `pwx promote`, and the next
+session's first `pwx open` applies it before that session's first page
+loads. In practice, with `pwx`, log in, `pwx end`, `pwx promote`, with no
+wait required in between.
+
+`pwx promote` warns when the promoted profile has no stored cookies, but
+only when the golden profile carries no storage-state snapshot either. When
+a snapshot did travel with the profile, an empty on-disk cookie database is
+the expected state rather than a failure, so no warning is printed.

@@ -1,0 +1,16 @@
+{
+  "name": "pwx",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Per-session browser wrapper over @playwright/cli",
+  "bin": { "pwx": "bin/pwx.js" },
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "test": "node test/run-tests.js unit",
+    "test:integration": "node test/run-tests.js integration"
+  },
+  "dependencies": {
+    "@playwright/cli": "0.1.19"
+  }
+}
