@@ -7,13 +7,14 @@ import { get as getAdapter } from '../lib/browsers/index.js'
 import { macChromeWarning } from '../lib/browsers/chromium.js'
 import * as engine from '../lib/engine.js'
 import * as session from '../lib/session.js'
+import * as token from '../lib/token.js'
 import { runMenu } from '../lib/menu.js'
 
 const PASSTHROUGH_NO_SESSION = new Set(['list', 'close-all', 'kill-all', 'install', '--version', '-V'])
 const WRAPPER_VERBS = new Set([
   'help', '-h', '--help', 'open', 'fresh', 'end', 'show', 'hide', 'status',
   'gc', 'promote', 'forget', 'logout', 'nuke', 'selftest', 'config', 'menu',
-  'attach', 'detach'
+  'attach', 'detach', 'token'
 ])
 const READ_ONLY = new Set(['help', '-h', '--help', 'status', 'gc', 'list', 'selftest', 'config', '--version', '-V'])
 const DEFAULT_ATTACH_CHANNEL = 'chrome'
@@ -47,6 +48,53 @@ export function extractBrowser (argv) {
     out.push(argv[i])
   }
   return { argv: out, browser }
+}
+
+// Reads a secret from stdin rather than an argv, so it never lands in shell
+// history or a process listing. Piped input (a file, `echo ... |`, or an
+// automated caller) is read to EOF verbatim — that's the caller's own data,
+// never echoed anywhere by us. An interactive terminal instead gets a
+// password-style prompt: raw mode, one keystroke at a time, nothing written
+// back to the screen — the token must never appear in scrollback or a
+// screen share, which is the entire point of moving it out of a shell
+// profile in the first place.
+function readSecret (promptText) {
+  if (!process.stdin.isTTY) {
+    return new Promise((resolvePromise, reject) => {
+      let data = ''
+      process.stdin.setEncoding('utf8')
+      process.stdin.on('data', chunk => { data += chunk })
+      process.stdin.on('end', () => resolvePromise(data.trim()))
+      process.stdin.on('error', reject)
+    })
+  }
+  return new Promise(resolvePromise => {
+    process.stdout.write(promptText)
+    const stdin = process.stdin
+    stdin.resume()
+    stdin.setEncoding('utf8')
+    stdin.setRawMode(true)
+    let input = ''
+    const ENTER = new Set(['\n', '\r', '\u0004']) // \u0004 = Ctrl-D / EOF
+    const INTERRUPT = '\u0003' // Ctrl-C
+    const BACKSPACE = new Set(['\u007f', '\b'])
+    const onData = chunk => {
+      for (const ch of chunk) {
+        if (ENTER.has(ch)) {
+          stdin.setRawMode(false)
+          stdin.pause()
+          stdin.removeListener('data', onData)
+          process.stdout.write('\n')
+          resolvePromise(input.trim())
+          return
+        }
+        if (ch === INTERRUPT) { process.stdout.write('\n'); process.exit(130) }
+        if (BACKSPACE.has(ch)) { input = input.slice(0, -1); continue }
+        input += ch
+      }
+    }
+    stdin.on('data', onData)
+  })
 }
 
 async function launchArgs (ctx, adapter) {
@@ -254,6 +302,11 @@ async function main () {
     case 'status': {
       const listing = await engine.run(ctx, ['list'], { capture: true, session: false })
       process.stdout.write(listing.stdout)
+      // Reports whether a token is configured and where it came from —
+      // never the value itself, which tokenStatusLine's caller (here) never
+      // even holds: token.resolveExtensionToken's return is read only for
+      // .source/.error, its .token field is ignored entirely below.
+      say(tokenStatusLine(ctx))
       // An attached session has no pwx-owned profile or golden directory —
       // printing those paths would name locations that do not apply to it
       // and imply pwx owns state that it does not.
@@ -463,18 +516,25 @@ async function main () {
       }
 
       // Not open anywhere: establish it.
-      // PLAYWRIGHT_MCP_EXTENSION_TOKEN, if set, is read straight out of the
-      // environment by the engine (engine.run forwards process.env
-      // unchanged) — it is never read, logged, or passed explicitly here.
-      if (!process.env.PLAYWRIGHT_MCP_EXTENSION_TOKEN) {
-        warn('no PLAYWRIGHT_MCP_EXTENSION_TOKEN set — a new tab is about to open in your browser asking you to approve the Playwright extension connection. Approve it there; this command will continue once you do (it is not hung).')
+      // The token, if any, is resolved once here — environment first, then
+      // the owner-only token file (lib/token.js) — and handed to the engine
+      // through its child-process env only. Neither branch below prints
+      // tokenInfo.token or tokenInfo itself; only the file PATH and its
+      // permission bits are ever named in a message.
+      const tokenInfo = token.resolveExtensionToken(ctx)
+      if (tokenInfo.error) {
+        die(`refusing to read the extension token file at ${tokenInfo.error.path} — its permissions (${tokenInfo.error.mode.toString(8)}) are broader than owner-only (600). Fix with 'chmod 600 ${tokenInfo.error.path}', or overwrite it with 'pwx token set'.`)
+      }
+      if (!tokenInfo.token) {
+        warn("no extension token configured (env PLAYWRIGHT_MCP_EXTENSION_TOKEN, or 'pwx token set') — a new tab is about to open in your browser asking you to approve the Playwright extension connection. Approve it there; this command will continue once you do (it is not hung).")
       }
       // capture: true, deliberately never printed below. playwright-cli's own
       // attach output includes the extension connect page's full URL, which
-      // carries PLAYWRIGHT_MCP_EXTENSION_TOKEN as a query parameter in
-      // cleartext — inheriting stdio here would print a credential to every
-      // terminal (and every log/transcript capturing it) that runs this verb.
-      const r = await engine.run(shared, ['attach', `--extension=${channel}`], { capture: true })
+      // carries the token as a query parameter in cleartext — inheriting
+      // stdio here would print a credential to every terminal (and every
+      // log/transcript capturing it) that runs this verb.
+      const tokenEnv = tokenInfo.token ? { PLAYWRIGHT_MCP_EXTENSION_TOKEN: tokenInfo.token } : {}
+      const r = await engine.run(shared, ['attach', `--extension=${channel}`], { capture: true, env: tokenEnv })
       if (r.code !== 0) die(`attach failed (exit ${r.code}) — your browser was not touched.`)
       session.setAttached(ctx, channel)
       say(`attached to your real ${channel} browser via the extension, on the shared session '${ATTACH_SESSION_NAME}' — any Claude session can join it with a plain 'pwx attach', no flags to pass. 'pwx end' detaches without closing your browser (and disconnects any other session that had joined it).`)
@@ -485,6 +545,30 @@ async function main () {
       const r = await engine.run(ctx, ['detach'])
       if (ctx.attached) session.clearAttached(ctx)
       process.exit(r.code)
+    }
+
+    case 'token': {
+      // PLAYWRIGHT_MCP_EXTENSION_TOKEN bypasses the extension's own approval
+      // dialog, so it is a credential — this is the only place pwx stores or
+      // clears it, and the value itself is never an argv (visible in `ps`
+      // and shell history), only ever read from stdin.
+      if (rest[0] === 'set') {
+        const value = await readSecret('paste the extension token, then press Enter (input is hidden): ')
+        if (!value) die('no token read from stdin — nothing was stored.')
+        const file = token.writeExtensionToken(ctx, value, ctx.platform)
+        say(`stored the extension token at ${file} (owner-only, mode 600). 'pwx status' confirms it is configured, without ever showing it.`)
+        return
+      }
+      if (rest[0] === 'clear') {
+        const existed = token.clearExtensionToken(ctx)
+        say(existed ? `cleared the stored extension token (${token.tokenPath(ctx)}).` : 'no stored extension token file to clear.')
+        return
+      }
+      say(`pwx token set     read a new extension token from stdin and store it owner-only (never echoed, never an argv)
+pwx token clear   remove the stored token file
+An environment variable PLAYWRIGHT_MCP_EXTENSION_TOKEN, if set, always wins over the file.
+'pwx status' shows whether a token is configured and where from — never the value.`)
+      return
     }
 
     case 'config': {
@@ -563,6 +647,13 @@ async function main () {
   }
 }
 
+function tokenStatusLine (ctx) {
+  const t = token.resolveExtensionToken(ctx)
+  if (t.error) return `extension token: NOT USED — file at ${t.error.path} has permissions ${t.error.mode.toString(8)}, broader than owner-only (600); fix with 'chmod 600' or 'pwx token set'`
+  if (t.token) return `extension token: configured (from ${t.source === 'env' ? 'PLAYWRIGHT_MCP_EXTENSION_TOKEN env var' : `file: ${token.tokenPath(ctx)}`})`
+  return "extension token: not configured — 'pwx attach' will open a browser tab asking you to approve the connection ('pwx token set' to avoid that)"
+}
+
 function printHelp (ctx) {
   const mode = ctx.headless ? 'headless (invisible)' : 'headed (visible)'
   const scope = ctx.isolated ? 'isolated to this agent session' : 'shared (no CLAUDE_CODE_SESSION_ID, or PW_PROFILE_DIR set)'
@@ -582,6 +673,8 @@ function printHelp (ctx) {
   pwx end            close the session (saved login persists on disk)
   pwx nuke           reset THIS session (--all resets every session)
   pwx attach [chrome]  attach to YOUR real, already-running browser via the extension (shared by every agent session; 'pwx end' detaches, leaves it running)
+  pwx token set      store the extension approval token from stdin, owner-only (never an argv, never shown back)
+  pwx token clear    remove the stored token file
   pwx config         show or set machine defaults (browser, headed)
   pwx menu           interactive picker
   pwx selftest       verify session mode + no repo litter

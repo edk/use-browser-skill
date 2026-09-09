@@ -205,11 +205,27 @@ pwx attach            attach to your real, already-running Chrome
 pwx attach msedge     same, but to a running Edge instead
 ```
 
-The Playwright extension must already be installed in that browser. Set
-`PLAYWRIGHT_MCP_EXTENSION_TOKEN` in your shell profile beforehand so the
-attach happens without a manual approval click; without it, attaching opens
-a new tab asking you to approve the connection, and `pwx attach` waits for
-that click rather than hanging silently.
+The Playwright extension must already be installed in that browser. Its
+approval token, `PLAYWRIGHT_MCP_EXTENSION_TOKEN`, bypasses the browser's own
+"approve this connection" dialog — anything that can read it can drive your
+browser silently — so it deserves better than living in a shell profile,
+where it is one accidental `cat`, `env`, screen share, or dotfiles commit
+away from leaking into a place it can't be pulled back out of. Store it
+instead with:
+
+```
+pwx token set     # paste the token, press Enter — read from stdin, never an argv, never echoed
+pwx token clear   # remove it
+```
+
+`pwx token set` writes it to an owner-only file (mode 600) under pwx's own
+state directory; `pwx attach` reads it from there automatically. If you
+still export `PLAYWRIGHT_MCP_EXTENSION_TOKEN` from your shell, that value
+always wins over the file, and pwx never prints it either way. Without a
+token configured (either way), attaching opens a new tab asking you to
+approve the connection, and `pwx attach` waits for that click rather than
+hanging silently. `pwx status` reports whether a token is configured and
+where it came from (environment or file), never the value.
 
 Once attached, a session is marked as such (the `attached` file above) for
 every later `pwx <verb>` invocation, which is a separate process each time.
