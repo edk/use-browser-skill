@@ -139,10 +139,10 @@ test('ordinary verbs from a second, joined Claude session target the same shared
   assert.deepEqual(r.calls.at(-1).argv, [`-s=${ATTACH_SESSION_NAME}`, 'goto', 'https://example.test'])
 })
 
-test('attach warns plainly when no token is set, rather than appearing to hang', async () => {
+test('attach warns plainly when no token is set (env or file), rather than appearing to hang', async () => {
   const root = mkroot()
   const r = await runIn(root, ['attach'], { PW_STUB_LIST: listFile(root, []), PLAYWRIGHT_MCP_EXTENSION_TOKEN: '' })
-  assert.match(r.stderr, /no PLAYWRIGHT_MCP_EXTENSION_TOKEN set/)
+  assert.match(r.stderr, /no extension token configured/)
   assert.match(r.stderr, /approve/i)
 })
 
@@ -150,7 +150,7 @@ test('attach does not warn, log, or print the token when one is set', async () =
   const root = mkroot()
   const token = 'super-secret-test-token-value'
   const r = await runIn(root, ['attach'], { PW_STUB_LIST: listFile(root, []), PLAYWRIGHT_MCP_EXTENSION_TOKEN: token })
-  assert.doesNotMatch(r.stderr, /PLAYWRIGHT_MCP_EXTENSION_TOKEN set/)
+  assert.doesNotMatch(r.stderr, /no extension token configured/)
   assert.ok(!r.stdout.includes(token), 'the token must never be printed to stdout')
   assert.ok(!r.stderr.includes(token), 'the token must never be printed to stderr')
   assert.ok(!fs.readFileSync(markerFor(root), 'utf8').includes(token), 'the token must never be written to the session marker')
