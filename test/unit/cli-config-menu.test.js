@@ -43,7 +43,20 @@ test('config set writes config.json and takes effect', async () => {
 test('config set rejects an unknown key and an invalid browser', async () => {
   const root = mkroot()
   assert.equal((await runIn(root, ['config', 'set', 'colour', 'blue'])).code, 2)
-  assert.equal((await runIn(root, ['config', 'set', 'browser', 'webkit'])).code, 2)
+  const bad = await runIn(root, ['config', 'set', 'browser', 'webkit'])
+  assert.equal(bad.code, 2)
+  assert.match(bad.stderr, /unsupported browser 'webkit'/)
+})
+
+test('config set accepts chrome and msedge as browser values', async () => {
+  const root = mkroot()
+  await runIn(root, ['config', 'set', 'browser', 'chrome'])
+  assert.equal(JSON.parse(fs.readFileSync(path.join(root, 'config.json'), 'utf8')).browser, 'chrome')
+  assert.match((await runIn(root, ['config'])).stdout, /browser\s+chrome\s+config/)
+
+  await runIn(root, ['config', 'set', 'browser', 'msedge'])
+  assert.equal(JSON.parse(fs.readFileSync(path.join(root, 'config.json'), 'utf8')).browser, 'msedge')
+  assert.match((await runIn(root, ['config'])).stdout, /browser\s+msedge\s+config/)
 })
 
 test('menu maps a numbered choice plus a URL prompt to argv', async () => {

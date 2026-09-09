@@ -86,6 +86,52 @@ test('switching browser mid-session is an error', async () => {
   assert.match(r.stderr, /already running firefox/)
 })
 
+test('switching to a real-browser channel mid-session is an error, same guard as chromium/firefox', async () => {
+  const pre = fs.mkdtempSync(path.join(os.tmpdir(), 'pwx-pre-'))
+  const lf = listFile(pre, [])
+  const first = await runCli(['open', '--browser', 'chrome', 'https://e.test'], { PW_STUB_LIST: lf })
+  const r = await new Promise(resolve => {
+    execFile(process.execPath, [CLI, 'open', '--browser', 'msedge', 'https://e.test'], {
+      env: { ...process.env, PW_BIN: STUB, PW_STATE_ROOT: first.root, PW_SCRATCH_DIR: path.join(first.root, 'scratch'), CLAUDE_CODE_SESSION_ID: 'sess1', PW_STUB_LIST: lf }
+    }, (err, stdout, stderr) => resolve({ code: err?.code ?? 0, stderr }))
+  })
+  assert.equal(r.code, 2)
+  assert.match(r.stderr, /already running chrome/)
+})
+
+test('open with --browser chrome launches the chrome channel and records it', async () => {
+  const pre = fs.mkdtempSync(path.join(os.tmpdir(), 'pwx-pre-'))
+  const lf = listFile(pre, [])
+  const r = await runCli(['open', '--browser', 'chrome', 'https://example.test'], { PW_STUB_LIST: lf })
+  const openCall = r.calls.find(c => c.argv.includes('open'))
+  assert.ok(openCall.argv.includes('chrome'))
+  assert.equal(fs.readFileSync(path.join(r.root, 'sessions', 'sess1', 'browser'), 'utf8').trim(), 'chrome')
+})
+
+test('open with --browser msedge launches the msedge channel and records it', async () => {
+  const pre = fs.mkdtempSync(path.join(os.tmpdir(), 'pwx-pre-'))
+  const lf = listFile(pre, [])
+  const r = await runCli(['open', '--browser', 'msedge', 'https://example.test'], { PW_STUB_LIST: lf })
+  const openCall = r.calls.find(c => c.argv.includes('open'))
+  assert.ok(openCall.argv.includes('msedge'))
+  assert.equal(fs.readFileSync(path.join(r.root, 'sessions', 'sess1', 'browser'), 'utf8').trim(), 'msedge')
+})
+
+test('opening on the chrome channel on macOS prints the replayd warning once; chromium does not', async () => {
+  const preC = fs.mkdtempSync(path.join(os.tmpdir(), 'pwx-pre-'))
+  const chromeRun = await runCli(['open', '--browser', 'chrome', 'https://example.test'], { PW_STUB_LIST: listFile(preC, []) })
+  const preM = fs.mkdtempSync(path.join(os.tmpdir(), 'pwx-pre-'))
+  const chromiumRun = await runCli(['open', 'https://example.test'], { PW_STUB_LIST: listFile(preM, []) })
+  if (process.platform === 'darwin') {
+    assert.match(chromeRun.stderr, /replayd/)
+    assert.equal((chromeRun.stderr.match(/replayd/g) || []).length, 1)
+    assert.doesNotMatch(chromiumRun.stderr, /replayd/)
+  } else {
+    assert.doesNotMatch(chromeRun.stderr, /replayd/)
+    assert.doesNotMatch(chromiumRun.stderr, /replayd/)
+  }
+})
+
 test('unknown verbs pass through with the session flag', async () => {
   const r = await runCli(['snapshot'])
   assert.deepEqual(r.calls.at(-1).argv, ['-s=pw-sess1', 'snapshot'])

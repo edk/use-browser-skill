@@ -4,12 +4,65 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { get, names } from '../../lib/browsers/index.js'
+import { macChromeWarning } from '../../lib/browsers/chromium.js'
+import { BROWSERS } from '../../lib/config.js'
 
 const mk = () => fs.mkdtempSync(path.join(os.tmpdir(), 'pwx-b-'))
 
-test('registry exposes both browsers and rejects others', () => {
-  assert.deepEqual(names, ['chromium', 'firefox'])
+test('registry exposes all four browsers and rejects others', () => {
+  assert.deepEqual(names, ['chromium', 'chrome', 'msedge', 'firefox'])
   assert.throws(() => get('webkit'), /unsupported browser/)
+})
+
+test('config BROWSERS matches the registry, in the same order', () => {
+  assert.deepEqual(BROWSERS, names)
+})
+
+test('chrome and msedge are Chromium-family: same lock files, prune list, cookie and argv logic as chromium', () => {
+  const chromium = get('chromium')
+  const chrome = get('chrome')
+  const msedge = get('msedge')
+  for (const other of [chrome, msedge]) {
+    assert.deepEqual(other.lockFiles, chromium.lockFiles)
+    assert.deepEqual(other.pruneDirs, chromium.pruneDirs)
+    assert.equal(other.unsafeUrl('https://d.test/x/export?format=csv'), chromium.unsafeUrl('https://d.test/x/export?format=csv'))
+  }
+})
+
+test('each Chromium-family adapter carries its own name and cliBrowser', () => {
+  assert.equal(get('chromium').name, 'chromium')
+  assert.equal(get('chromium').cliBrowser, 'chromium')
+  assert.equal(get('chrome').name, 'chrome')
+  assert.equal(get('chrome').cliBrowser, 'chrome')
+  assert.equal(get('msedge').name, 'msedge')
+  assert.equal(get('msedge').cliBrowser, 'msedge')
+})
+
+test('chrome and msedge share chromium argvMatches/beforeLaunch/cookieCount behaviour', async () => {
+  for (const name of ['chrome', 'msedge']) {
+    const adapter = get(name)
+    const dir = '/a b/prof'
+    assert.equal(adapter.argvMatches(`chrome --user-data-dir=${dir} --x`, dir, 'linux'), true)
+    assert.equal(adapter.argvMatches(`chrome --user-data-dir=${dir}-2`, dir, 'linux'), false)
+
+    const profileDir = mk()
+    const prefs = path.join(profileDir, 'Default', 'Preferences')
+    fs.mkdirSync(path.dirname(prefs), { recursive: true })
+    fs.writeFileSync(prefs, JSON.stringify({ profile: { exit_type: 'Crashed', exited_cleanly: false } }))
+    await adapter.beforeLaunch(profileDir)
+    const after = JSON.parse(fs.readFileSync(prefs, 'utf8'))
+    assert.equal(after.profile.exit_type, 'Normal')
+
+    assert.equal(await adapter.cookieCount(mk()), null)
+  }
+})
+
+test('macChromeWarning: only chrome, only darwin', () => {
+  assert.match(macChromeWarning('chrome', 'darwin'), /replayd/)
+  assert.equal(macChromeWarning('chromium', 'darwin'), null)
+  assert.equal(macChromeWarning('msedge', 'darwin'), null)
+  assert.equal(macChromeWarning('chrome', 'linux'), null)
+  assert.equal(macChromeWarning('chrome', 'win32'), null)
 })
 
 test('chromium argvMatches is exact, space tolerant, and rejects prefixes', () => {
