@@ -174,6 +174,8 @@ Chromium's own keychain-encrypted cookie store.
 ```
 config.json          machine defaults: browser, headed, stateDir
 golden/chromium/      seed profile for new Chromium sessions
+golden/chrome/         seed profile for new real-Chrome sessions
+golden/msedge/         seed profile for new real-Edge sessions
 golden/firefox/       seed profile for new Firefox sessions
 sessions/<key>/       one directory per agent session
   profile/            that session's live browser profile

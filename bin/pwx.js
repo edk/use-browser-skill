@@ -4,6 +4,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { resolve as resolveCtx, configPath, BROWSERS } from '../lib/config.js'
 import { get as getAdapter } from '../lib/browsers/index.js'
+import { macChromeWarning } from '../lib/browsers/chromium.js'
 import * as engine from '../lib/engine.js'
 import * as session from '../lib/session.js'
 import { runMenu } from '../lib/menu.js'
@@ -46,6 +47,8 @@ async function launchArgs (ctx, adapter) {
 }
 
 async function doLaunch (ctx, adapter, urls) {
+  const chromeWarning = macChromeWarning(adapter.name, ctx.platform)
+  if (chromeWarning) warn(chromeWarning)
   const args = await launchArgs(ctx, adapter)
   const cleared = await engine.clearSessionCache(ctx)
   if (cleared.dirMissing) {
@@ -413,6 +416,8 @@ function printHelp (ctx) {
 
   pwx open URL       open (or reuse) this session's browser and navigate
   pwx open --browser firefox URL   same, on Firefox (per session; chromium is the default)
+  pwx open --browser chrome URL    same, on real installed Google Chrome
+  pwx open --browser msedge URL    same, on real installed Microsoft Edge
   pwx show           make the browser visible (relaunch headed; logins + page survive)
   pwx hide           make the browser invisible again (relaunch headless)
   pwx status         session name, browser, profile, mode, last used, orphan warnings

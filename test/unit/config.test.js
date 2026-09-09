@@ -81,6 +81,25 @@ test('browser precedence: flag over env over session over config over default', 
   assert.equal(ctx.browserSource, 'flag')
 })
 
+test('chrome and msedge resolve to their own golden directories, distinct from chromium', () => {
+  const base = { platform: 'linux', homedir: HOME, env: { PW_STATE_ROOT: '/s' } }
+  const chromium = resolve(base)
+  const chrome = resolve({ ...base, argvBrowser: 'chrome' })
+  const msedge = resolve({ ...base, argvBrowser: 'msedge' })
+  assert.equal(chrome.browser, 'chrome')
+  assert.equal(chrome.goldenDir, path.join('/s', 'golden', 'chrome'))
+  assert.equal(msedge.browser, 'msedge')
+  assert.equal(msedge.goldenDir, path.join('/s', 'golden', 'msedge'))
+  assert.notEqual(chrome.goldenDir, chromium.goldenDir)
+  assert.notEqual(chrome.goldenDir, msedge.goldenDir)
+})
+
+test('an unsupported browser is rejected, naming which source it came from', () => {
+  const base = { platform: 'linux', homedir: HOME, env: { PW_STATE_ROOT: '/s' } }
+  assert.throws(() => resolve({ ...base, argvBrowser: 'webkit' }), /unsupported browser 'webkit' \(from flag\)/)
+  assert.throws(() => resolve({ ...base, env: { ...base.env, PW_BROWSER: 'webkit' } }), /unsupported browser 'webkit' \(from env\)/)
+})
+
 test('headless follows the mode file unless the env overrides', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pwx-m-'))
   const base = { platform: 'linux', homedir: HOME, env: { PW_STATE_ROOT: root, CLAUDE_CODE_SESSION_ID: 'k9' } }
