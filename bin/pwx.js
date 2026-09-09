@@ -2,7 +2,7 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { resolve as resolveCtx, configPath, BROWSERS } from '../lib/config.js'
+import { resolve as resolveCtx, configPath, BROWSERS, ATTACH_SESSION_NAME } from '../lib/config.js'
 import { get as getAdapter } from '../lib/browsers/index.js'
 import { macChromeWarning } from '../lib/browsers/chromium.js'
 import * as engine from '../lib/engine.js'
@@ -203,11 +203,16 @@ async function main () {
       // the browser it is shutting down. `detach` only tears down pwx's own
       // extension connection; the browser survives it regardless of outcome,
       // so a non-zero exit here is reported but still treated as "done".
+      //
+      // The connection it tears down is the single SHARED one every attached
+      // Claude session uses (ctx.session is ATTACH_SESSION_NAME here) — this
+      // disconnects every session that joined it, not just this one, so the
+      // message says that plainly rather than implying a private teardown.
       if (ctx.attached) {
         const r = await engine.run(ctx, ['detach'], { capture: true })
         session.clearAttached(ctx)
         if (r.code !== 0) warn(`detach reported a problem (exit ${r.code}) — your browser was not touched either way. 'pwx status' to check.`)
-        say(`session '${ctx.session}' detached (your ${ctx.attachedChannel} browser is untouched and still running).`)
+        say(`detached the shared attach connection — if another Claude session had joined it, that session is disconnected too. Your ${ctx.attachedChannel} browser itself is untouched and still running.`)
         return
       }
       await session.captureStorageState(ctx, engine.run)
@@ -253,7 +258,7 @@ async function main () {
       // printing those paths would name locations that do not apply to it
       // and imply pwx owns state that it does not.
       if (ctx.attached) {
-        say(`this session: '${ctx.session}' — ATTACHED to your real ${ctx.attachedChannel} browser via the extension (pwx does not own this browser or its profile)`)
+        say(`this agent (${ctx.ownSession}) is ATTACHED, via the shared connection '${ctx.session}', to your real ${ctx.attachedChannel} browser (pwx does not own this browser or its profile; any Claude session can join the same connection with 'pwx attach')`)
         const attachedState = await engine.sessionState(ctx)
         say(attachedState === 'open'
           ? 'state: attached and connected'
@@ -299,8 +304,8 @@ async function main () {
       if (ctx.attached) {
         const attachedState = await engine.sessionState(ctx)
         say(attachedState === 'open'
-          ? `session '${ctx.session}' is attached and connected — nothing to clean (pwx does not own this browser).`
-          : `session '${ctx.session}' is attached but not currently connected — 'pwx attach' to reconnect, or 'pwx end' to clear the marker. Nothing to reap: pwx does not own this browser.`)
+          ? `the shared attach connection '${ctx.session}' is connected — nothing to clean (pwx does not own this browser).`
+          : `this agent (${ctx.ownSession}) is marked attached, but the shared connection '${ctx.session}' is not currently connected — 'pwx attach' to (re)join it, or 'pwx end' to clear the marker. Nothing to reap: pwx does not own this browser.`)
         const attachedRows = await engine.listSessions(ctx)
         const attachedN = await session.sweepStale(ctx, { rows: attachedRows })
         if (attachedN > 0) warn(`reaped ${attachedN} stale session profile(s) (unused > ${ctx.ttlDays}d).`)
@@ -420,20 +425,44 @@ async function main () {
       // side effect of an ordinary open/goto call.
       if (flagBrowser) die(`'pwx attach' takes the extension channel as a plain argument, not --browser: run 'pwx attach ${flagBrowser}'.`)
       const channel = rest[0] || DEFAULT_ATTACH_CHANNEL
-      if (ctx.attached) {
-        if (ctx.attachedChannel === channel) {
-          const already = await engine.sessionState(ctx)
-          if (already === 'open') { say(`already attached to your real ${channel} browser (session '${ctx.session}').`); return }
-          // Fall through: marker says attached but the connection is gone
-          // (e.g. the daemon died) — retry the same attach below.
-        } else {
-          die(`session '${ctx.session}' is already attached to ${ctx.attachedChannel}. Run 'pwx end' first, then 'pwx attach ${channel}'.`)
-        }
-      } else {
-        const state = await engine.sessionState(ctx)
-        if (state === 'open') die(`session '${ctx.session}' already has a browser open that pwx launched itself. Run 'pwx end' first, then 'pwx attach' to switch to your real browser.`)
-        if (state === 'unknown') die("cannot tell whether a browser is already running — 'list' failed twice. Retry in a moment before attaching.")
+
+      if (!ctx.attached) {
+        // This agent has not joined attach mode yet: make sure it doesn't
+        // already have its own, pwx-launched browser open under its own
+        // per-agent session before handing that identity over to the shared
+        // one below. (ctx.session === ctx.ownSession here, since the
+        // override in lib/config.js only applies once ctx.attached is true.)
+        const ownState = await engine.sessionState(ctx)
+        if (ownState === 'open') die(`session '${ctx.session}' already has a browser open that pwx launched itself. Run 'pwx end' first, then 'pwx attach' to join the shared attached browser.`)
+        if (ownState === 'unknown') die("cannot tell whether a browser is already running — 'list' failed twice. Retry in a moment before attaching.")
       }
+
+      // Attach mode's session name is the one fixed constant
+      // ATTACH_SESSION_NAME, shared by every Claude session, so that any of
+      // them can join the same real-browser connection with no coordination
+      // and nothing to look up. ctx.session already equals it once
+      // ctx.attached is true (lib/config.js); `shared` reconstructs the same
+      // targeting by hand for the first-time-this-agent case, so a cold
+      // attach can still see whether some OTHER Claude session already
+      // established the shared connection.
+      const shared = ctx.attached ? ctx : { ...ctx, session: ATTACH_SESSION_NAME }
+      const rows = await engine.listSessions(shared)
+      if (rows === null) die("cannot tell whether the shared attach connection is already open — 'list' failed twice. Retry in a moment before attaching.")
+      const sharedRow = engine.sessionRow(rows, ATTACH_SESSION_NAME)
+
+      if (sharedRow && sharedRow.status === 'open') {
+        // Someone, this agent or another Claude session, is already
+        // attached and connected. Join it — never open a second connection
+        // (and a second connect-page tab) on top of it.
+        if (sharedRow.browserType && sharedRow.browserType !== channel) {
+          die(`the shared attach connection is already attached to ${sharedRow.browserType}, not ${channel}. Run 'pwx end' to drop it if you really want to switch, then 'pwx attach ${channel}'.`)
+        }
+        session.setAttached(ctx, sharedRow.browserType || channel)
+        say(`joining the existing shared attach connection (${sharedRow.browserType || channel}) — no new connection was opened.`)
+        return
+      }
+
+      // Not open anywhere: establish it.
       // PLAYWRIGHT_MCP_EXTENSION_TOKEN, if set, is read straight out of the
       // environment by the engine (engine.run forwards process.env
       // unchanged) — it is never read, logged, or passed explicitly here.
@@ -445,10 +474,10 @@ async function main () {
       // carries PLAYWRIGHT_MCP_EXTENSION_TOKEN as a query parameter in
       // cleartext — inheriting stdio here would print a credential to every
       // terminal (and every log/transcript capturing it) that runs this verb.
-      const r = await engine.run(ctx, ['attach', `--extension=${channel}`], { capture: true })
+      const r = await engine.run(shared, ['attach', `--extension=${channel}`], { capture: true })
       if (r.code !== 0) die(`attach failed (exit ${r.code}) — your browser was not touched.`)
       session.setAttached(ctx, channel)
-      say(`attached to your real ${channel} browser via the extension (session '${ctx.session}'). Ordinary verbs (goto, eval, snapshot, screenshot, …) now drive it. 'pwx end' detaches without closing your browser.`)
+      say(`attached to your real ${channel} browser via the extension, on the shared session '${ATTACH_SESSION_NAME}' — any Claude session can join it with a plain 'pwx attach', no flags to pass. 'pwx end' detaches without closing your browser (and disconnects any other session that had joined it).`)
       return
     }
 
@@ -552,7 +581,7 @@ function printHelp (ctx) {
   pwx forget         clear the saved login (--golden also clears the seed)
   pwx end            close the session (saved login persists on disk)
   pwx nuke           reset THIS session (--all resets every session)
-  pwx attach [chrome]  attach to YOUR real, already-running browser via the extension (not launched by pwx; 'pwx end' detaches, leaves it running)
+  pwx attach [chrome]  attach to YOUR real, already-running browser via the extension (shared by every agent session; 'pwx end' detaches, leaves it running)
   pwx config         show or set machine defaults (browser, headed)
   pwx menu           interactive picker
   pwx selftest       verify session mode + no repo litter

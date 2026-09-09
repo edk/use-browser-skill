@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { sessionKey, daemonDir, resolve } from '../../lib/config.js'
+import { sessionKey, daemonDir, resolve, ATTACH_SESSION_NAME } from '../../lib/config.js'
 
 const HOME = '/home/u'
 
@@ -130,6 +130,37 @@ test('attached and attachedChannel are read back from the session\'s attached ma
   const ctx = resolve({ env: { PW_STATE_ROOT: root, CLAUDE_CODE_SESSION_ID: 'k9' }, platform: 'linux', homedir: HOME })
   assert.equal(ctx.attached, true)
   assert.equal(ctx.attachedChannel, 'chrome')
+})
+
+test('an attached session\'s engine session name is the one fixed, shared constant, not its per-agent name', () => {
+  // The whole point of attach mode is that any Claude session can join the
+  // same real-browser connection with no coordination. A second agent (a
+  // different CLAUDE_CODE_SESSION_ID, hence a different per-agent stateDir)
+  // that has also attached must resolve to the exact same ctx.session as
+  // this one, so both reach the same playwright-cli session.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pwx-at-'))
+  const sdirA = path.join(root, 'sessions', 'agentA')
+  const sdirB = path.join(root, 'sessions', 'agentB')
+  fs.mkdirSync(sdirA, { recursive: true }); fs.writeFileSync(path.join(sdirA, 'attached'), 'chrome\n')
+  fs.mkdirSync(sdirB, { recursive: true }); fs.writeFileSync(path.join(sdirB, 'attached'), 'chrome\n')
+  const ctxA = resolve({ env: { PW_STATE_ROOT: root, CLAUDE_CODE_SESSION_ID: 'agentA' }, platform: 'linux', homedir: HOME })
+  const ctxB = resolve({ env: { PW_STATE_ROOT: root, CLAUDE_CODE_SESSION_ID: 'agentB' }, platform: 'linux', homedir: HOME })
+  assert.equal(ctxA.session, ATTACH_SESSION_NAME)
+  assert.equal(ctxB.session, ATTACH_SESSION_NAME)
+  assert.equal(ctxA.session, ctxB.session)
+  // Each agent's own per-agent identity, and its local bookkeeping
+  // directory, stay distinct regardless — only the engine-facing session
+  // name is unified.
+  assert.equal(ctxA.ownSession, 'pw-agentA')
+  assert.equal(ctxB.ownSession, 'pw-agentB')
+  assert.notEqual(ctxA.stateDir, ctxB.stateDir)
+})
+
+test('an unattached session keeps its own per-agent engine session name, unchanged', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pwx-at-'))
+  const ctx = resolve({ env: { PW_STATE_ROOT: root, CLAUDE_CODE_SESSION_ID: 'k9' }, platform: 'linux', homedir: HOME })
+  assert.equal(ctx.session, 'pw-k9')
+  assert.equal(ctx.ownSession, 'pw-k9')
 })
 
 test('PW_CACHE_DIR is ignored: it is the live bash tool\'s state root, not ours', () => {
