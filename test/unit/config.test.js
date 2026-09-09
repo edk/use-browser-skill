@@ -111,6 +111,27 @@ test('headless follows the mode file unless the env overrides', () => {
   assert.equal(resolve({ ...base, env: { ...base.env, PLAYWRIGHT_MCP_HEADLESS: 'false' } }).headless, false)
 })
 
+test('attached is false and attachedChannel is null with no marker on disk', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pwx-at-'))
+  const ctx = resolve({ env: { PW_STATE_ROOT: root, CLAUDE_CODE_SESSION_ID: 'k9' }, platform: 'linux', homedir: HOME })
+  assert.equal(ctx.attached, false)
+  assert.equal(ctx.attachedChannel, null)
+})
+
+test('attached and attachedChannel are read back from the session\'s attached marker, across process invocations', () => {
+  // Each `pwx <verb>` is a separate process; attach mode has to survive that
+  // by being written to disk (see setAttached in lib/session.js) and read
+  // back here on every later resolve(), the same way the `mode` and
+  // `browser` markers already do a few lines up in this file.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pwx-at-'))
+  const sdir = path.join(root, 'sessions', 'k9')
+  fs.mkdirSync(sdir, { recursive: true })
+  fs.writeFileSync(path.join(sdir, 'attached'), 'chrome\n')
+  const ctx = resolve({ env: { PW_STATE_ROOT: root, CLAUDE_CODE_SESSION_ID: 'k9' }, platform: 'linux', homedir: HOME })
+  assert.equal(ctx.attached, true)
+  assert.equal(ctx.attachedChannel, 'chrome')
+})
+
 test('PW_CACHE_DIR is ignored: it is the live bash tool\'s state root, not ours', () => {
   // A user with PW_CACHE_DIR exported pointed pwx at bin/pw's state directory.
   // The first isolated open ran the golden migration there and broke the bash

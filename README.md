@@ -181,6 +181,7 @@ sessions/<key>/       one directory per agent session
   profile/            that session's live browser profile
   browser              which browser this session recorded at open
   mode                 headed or headless
+  attached              present only after `pwx attach`; names the extension channel
   last-used            epoch seconds, used by pwx gc
 profile/              legacy shared profile when there is no session id
 ```
@@ -188,6 +189,41 @@ profile/              legacy shared profile when there is no session id
 Scratch and artifacts (screenshots, traces, and similar) go to a `pwx`
 subdirectory under the operating system's temp directory, never into a
 repo, separately from `pw`'s own scratch directory.
+
+### Attaching to your real browser
+
+`pwx open` normally launches a browser pwx owns: a separate profile it
+seeds, promotes, and can freely relaunch or kill. `pwx attach` is the
+opposite: it connects pwx to *your own, already-running* browser over the
+Playwright extension, instead of launching one of its own. This matters on
+sites that block a Playwright-launched browser (Cloudflare's challenge page,
+for example) but load fine in a real browser with your own profile, history,
+and IP.
+
+```
+pwx attach            attach to your real, already-running Chrome
+pwx attach msedge     same, but to a running Edge instead
+```
+
+The Playwright extension must already be installed in that browser. Set
+`PLAYWRIGHT_MCP_EXTENSION_TOKEN` in your shell profile beforehand so the
+attach happens without a manual approval click; without it, attaching opens
+a new tab asking you to approve the connection, and `pwx attach` waits for
+that click rather than hanging silently.
+
+Once attached, a session is marked as such (the `attached` file above) for
+every later `pwx <verb>` invocation, which is a separate process each time.
+Ordinary verbs — `goto`, `eval`, `snapshot`, `screenshot`, and the rest —
+drive the real browser exactly as they would an owned one. But an attached
+session's browser is not pwx's to launch, seed, or kill, so:
+
+- `pwx end` detaches and leaves your browser open and untouched, rather than
+  closing and killing it.
+- `pwx fresh`, `pwx show`/`pwx hide`, `pwx promote`, and `pwx forget` all
+  refuse outright, since each assumes pwx owns the profile it is
+  relaunching, seeding, or erasing.
+- `pwx status` and `pwx gc` report the attached state instead of profile and
+  golden paths that do not apply.
 
 ### Running the test suites
 
