@@ -12,9 +12,22 @@ import { runMenu } from '../lib/menu.js'
 const PASSTHROUGH_NO_SESSION = new Set(['list', 'close-all', 'kill-all', 'install', '--version', '-V'])
 const WRAPPER_VERBS = new Set([
   'help', '-h', '--help', 'open', 'fresh', 'end', 'show', 'hide', 'status',
-  'gc', 'promote', 'forget', 'logout', 'nuke', 'selftest', 'config', 'menu'
+  'gc', 'promote', 'forget', 'logout', 'nuke', 'selftest', 'config', 'menu',
+  'attach', 'detach'
 ])
 const READ_ONLY = new Set(['help', '-h', '--help', 'status', 'gc', 'list', 'selftest', 'config', '--version', '-V'])
+const DEFAULT_ATTACH_CHANNEL = 'chrome'
+// These verbs are only meaningful for a browser and profile pwx launched and
+// owns itself — they relaunch, seed, promote, or erase a profile directory,
+// or otherwise assume pwx can freely restart the browser. An attached
+// session's browser is someone's real, already-running browser held over the
+// Playwright extension: pwx did not launch it, must never restart or kill
+// it, and has no profile of its own to seed/promote/erase. Refusing here,
+// before any of these verbs' bodies run, is what keeps their internal calls
+// to the process-killing/profile-deleting helpers in lib/session.js from
+// ever being reached in attach mode — see 'open', 'end', 'status', 'gc', and
+// 'nuke' below for the verbs that instead get their own attach-aware branch.
+const ATTACH_LOCKED = new Set(['fresh', 'show', 'hide', 'promote', 'forget', 'logout'])
 
 export function die (msg) {
   process.stderr.write(`pw: ${msg}\n`)
@@ -127,6 +140,10 @@ async function main () {
     die(`session '${ctx.session}' is already running ${recorded}. Run 'pwx end' and then 'pwx forget' to switch to ${ctx.browser}.`)
   }
 
+  if (ctx.attached && ATTACH_LOCKED.has(cmd)) {
+    die(`session '${ctx.session}' is attached to your real ${ctx.attachedChannel} browser — '${cmd}' assumes pwx owns the browser and its profile, which isn't true here. 'pwx end' detaches (your browser stays open and untouched); 'pwx status' shows the attached state.`)
+  }
+
   if (!READ_ONLY.has(cmd)) session.touchLastUsed(ctx)
   // A fixed, predictable scratch directory under the system temp dir sits
   // inside a world-readable, world-writable location on a shared machine
@@ -155,6 +172,14 @@ async function main () {
         }
         return
       }
+      // An attached session's browser is the owner's real, already-running
+      // one — it is never something pwx launched, so there is no orphan of
+      // ours to reap and no profile of ours to launch a fresh browser onto.
+      // Refusing here, before profileBrowserPids/killProfileBrowsers run,
+      // keeps this reap-orphans path from ever executing in attach mode.
+      if (ctx.attached) {
+        die(`session '${ctx.session}' was attached to your real ${ctx.attachedChannel} browser but is no longer connected. Run 'pwx attach' to reconnect — 'pwx open' will not launch a browser of its own for an attached session.`)
+      }
       const orphans = await session.profileBrowserPids(adapter, ctx.profileDir, { platform: ctx.platform })
       if (orphans.length) warn(`no live session for '${ctx.session}' — reaping the orphaned browser still holding your profile, then launching a new one.`)
       await session.killProfileBrowsers(ctx, adapter)
@@ -172,6 +197,19 @@ async function main () {
       return
 
     case 'end':
+      // An attached session's browser is the owner's real one, holding every
+      // account they are signed into. 'end' must detach and leave it running
+      // and untouched — never capture/close/kill, which all assume pwx owns
+      // the browser it is shutting down. `detach` only tears down pwx's own
+      // extension connection; the browser survives it regardless of outcome,
+      // so a non-zero exit here is reported but still treated as "done".
+      if (ctx.attached) {
+        const r = await engine.run(ctx, ['detach'], { capture: true })
+        session.clearAttached(ctx)
+        if (r.code !== 0) warn(`detach reported a problem (exit ${r.code}) — your browser was not touched either way. 'pwx status' to check.`)
+        say(`session '${ctx.session}' detached (your ${ctx.attachedChannel} browser is untouched and still running).`)
+        return
+      }
       await session.captureStorageState(ctx, engine.run)
       await engine.run(ctx, ['close'], { capture: true })
       await session.killProfileBrowsers(ctx, adapter)
@@ -211,6 +249,23 @@ async function main () {
     case 'status': {
       const listing = await engine.run(ctx, ['list'], { capture: true, session: false })
       process.stdout.write(listing.stdout)
+      // An attached session has no pwx-owned profile or golden directory —
+      // printing those paths would name locations that do not apply to it
+      // and imply pwx owns state that it does not.
+      if (ctx.attached) {
+        say(`this session: '${ctx.session}' — ATTACHED to your real ${ctx.attachedChannel} browser via the extension (pwx does not own this browser or its profile)`)
+        const attachedState = await engine.sessionState(ctx)
+        say(attachedState === 'open'
+          ? 'state: attached and connected'
+          : attachedState === 'unknown'
+            ? 'state: unknown'
+            : "state: not connected ('pwx attach' to reconnect; 'pwx end' clears the marker)")
+        try {
+          const stamp = Number(fs.readFileSync(path.join(ctx.stateDir, 'last-used'), 'utf8').trim())
+          if (Number.isFinite(stamp) && stamp) say(`last used: ${new Date(stamp * 1000).toString()}`)
+        } catch {}
+        return
+      }
       say(ctx.isolated
         ? `this session: '${ctx.session}' (isolated; other rows above belong to other sessions)`
         : `this session: '${ctx.session}' (SHARED profile — other sessions can drive this browser)`)
@@ -236,6 +291,21 @@ async function main () {
     }
 
     case 'gc': {
+      // Nothing to reap for an attached session: there is no pwx-owned
+      // profile browser to have gone orphan in the first place. Branching
+      // here, rather than letting killProfileBrowsers' own attach guard
+      // silently no-op, keeps that helper out of this call path entirely and
+      // avoids a "cleaned up" message that implies pwx reaped something.
+      if (ctx.attached) {
+        const attachedState = await engine.sessionState(ctx)
+        say(attachedState === 'open'
+          ? `session '${ctx.session}' is attached and connected — nothing to clean (pwx does not own this browser).`
+          : `session '${ctx.session}' is attached but not currently connected — 'pwx attach' to reconnect, or 'pwx end' to clear the marker. Nothing to reap: pwx does not own this browser.`)
+        const attachedRows = await engine.listSessions(ctx)
+        const attachedN = await session.sweepStale(ctx, { rows: attachedRows })
+        if (attachedN > 0) warn(`reaped ${attachedN} stale session profile(s) (unused > ${ctx.ttlDays}d).`)
+        return
+      }
       const state = await engine.sessionState(ctx)
       if (state === 'open') {
         say(`session '${ctx.session}' is open and tracked — nothing to clean ('pwx end' closes it).`)
@@ -318,9 +388,19 @@ async function main () {
         // below) but not a fresher live-state overlay on top of it.
         await engine.run(ctx, ['close-all'], { capture: true, session: false })
         await engine.run(ctx, ['kill-all'], { capture: true, session: false })
-        await session.killProfileBrowsers(ctx, adapter)
+        // killProfileBrowsers targets THIS ctx's own profile directory only;
+        // an attached ctx has none, and "nothing may kill or terminate a
+        // browser process" holds regardless of which verb is asking, so the
+        // call is skipped outright here rather than left to that helper's
+        // own attach guard.
+        if (!ctx.attached) await session.killProfileBrowsers(ctx, adapter)
         fs.rmSync(ctx.scratchDir, { recursive: true, force: true })
         say(`reset ALL sessions (every session's browser killed, scratch wiped: ${ctx.scratchDir}; login profiles kept)`)
+      } else if (ctx.attached) {
+        // Scoped nuke captures, closes, and kills THIS session's own browser
+        // and keeps its profile — every part of that assumes pwx owns the
+        // browser it is resetting, which isn't true for an attached session.
+        die(`session '${ctx.session}' is attached to your real ${ctx.attachedChannel} browser — there is nothing pwx-owned to reset. 'pwx end' detaches (your browser stays open).`)
       } else {
         await session.captureStorageState(ctx, engine.run)
         await engine.run(ctx, ['close'], { capture: true })
@@ -331,6 +411,51 @@ async function main () {
         say(`other sessions and ${ctx.scratchDir} left alone ('pwx nuke --all' for the machine-wide reset)`)
       }
       return
+    }
+
+    case 'attach': {
+      // Explicit, named verb rather than a flag on 'open' — attaching hands
+      // pwx control of the owner's real browser instead of one it launches
+      // itself, so it must be something the user types on purpose, not a
+      // side effect of an ordinary open/goto call.
+      if (flagBrowser) die(`'pwx attach' takes the extension channel as a plain argument, not --browser: run 'pwx attach ${flagBrowser}'.`)
+      const channel = rest[0] || DEFAULT_ATTACH_CHANNEL
+      if (ctx.attached) {
+        if (ctx.attachedChannel === channel) {
+          const already = await engine.sessionState(ctx)
+          if (already === 'open') { say(`already attached to your real ${channel} browser (session '${ctx.session}').`); return }
+          // Fall through: marker says attached but the connection is gone
+          // (e.g. the daemon died) — retry the same attach below.
+        } else {
+          die(`session '${ctx.session}' is already attached to ${ctx.attachedChannel}. Run 'pwx end' first, then 'pwx attach ${channel}'.`)
+        }
+      } else {
+        const state = await engine.sessionState(ctx)
+        if (state === 'open') die(`session '${ctx.session}' already has a browser open that pwx launched itself. Run 'pwx end' first, then 'pwx attach' to switch to your real browser.`)
+        if (state === 'unknown') die("cannot tell whether a browser is already running — 'list' failed twice. Retry in a moment before attaching.")
+      }
+      // PLAYWRIGHT_MCP_EXTENSION_TOKEN, if set, is read straight out of the
+      // environment by the engine (engine.run forwards process.env
+      // unchanged) — it is never read, logged, or passed explicitly here.
+      if (!process.env.PLAYWRIGHT_MCP_EXTENSION_TOKEN) {
+        warn('no PLAYWRIGHT_MCP_EXTENSION_TOKEN set — a new tab is about to open in your browser asking you to approve the Playwright extension connection. Approve it there; this command will continue once you do (it is not hung).')
+      }
+      // capture: true, deliberately never printed below. playwright-cli's own
+      // attach output includes the extension connect page's full URL, which
+      // carries PLAYWRIGHT_MCP_EXTENSION_TOKEN as a query parameter in
+      // cleartext — inheriting stdio here would print a credential to every
+      // terminal (and every log/transcript capturing it) that runs this verb.
+      const r = await engine.run(ctx, ['attach', `--extension=${channel}`], { capture: true })
+      if (r.code !== 0) die(`attach failed (exit ${r.code}) — your browser was not touched.`)
+      session.setAttached(ctx, channel)
+      say(`attached to your real ${channel} browser via the extension (session '${ctx.session}'). Ordinary verbs (goto, eval, snapshot, screenshot, …) now drive it. 'pwx end' detaches without closing your browser.`)
+      return
+    }
+
+    case 'detach': {
+      const r = await engine.run(ctx, ['detach'])
+      if (ctx.attached) session.clearAttached(ctx)
+      process.exit(r.code)
     }
 
     case 'config': {
@@ -427,6 +552,7 @@ function printHelp (ctx) {
   pwx forget         clear the saved login (--golden also clears the seed)
   pwx end            close the session (saved login persists on disk)
   pwx nuke           reset THIS session (--all resets every session)
+  pwx attach [chrome]  attach to YOUR real, already-running browser via the extension (not launched by pwx; 'pwx end' detaches, leaves it running)
   pwx config         show or set machine defaults (browser, headed)
   pwx menu           interactive picker
   pwx selftest       verify session mode + no repo litter

@@ -7,7 +7,8 @@ import { get } from '../../lib/browsers/index.js'
 import { row } from './list-fixture.js'
 import {
   copyProfile, seedFromGolden, promote, sweepStale, migrateGolden,
-  profileBrowserPids, dirHasContent
+  profileBrowserPids, dirHasContent, killProfileBrowsers, setAttached,
+  clearAttached, attachedMarkerPath
 } from '../../lib/session.js'
 
 const mk = () => fs.mkdtempSync(path.join(os.tmpdir(), 'pwx-ss-'))
@@ -272,4 +273,63 @@ test('dirHasContent', () => {
   write(path.join(d, 'a'))
   assert.equal(dirHasContent(d), true)
   assert.equal(dirHasContent(path.join(d, 'nope')), false)
+})
+
+// --- attach mode: second line of defense against these functions ever being
+// asked to touch a real, owner-controlled browser or profile. bin/pwx.js
+// already refuses the verbs that would reach these call sites in attach
+// mode; these tests prove the functions themselves refuse too, so a future
+// call site that forgets that refusal still cannot kill a real browser or
+// delete real profile data. Each spies on the actual dependency the
+// destructive work would go through and asserts it is never invoked ---
+
+test('killProfileBrowsers refuses to look at or touch processes for an attached session', async () => {
+  const root = mk(); const ctx = { ...ctxFor(root), attached: true }
+  write(path.join(ctx.profileDir, 'Default', 'Cookies'))
+  let calls = 0
+  const pids = await killProfileBrowsers(ctx, get('chromium'), { listProcesses: async () => { calls++; return [] } })
+  assert.deepEqual(pids, [])
+  assert.equal(calls, 0, 'listProcesses must never be called for an attached session')
+  assert.equal(fs.existsSync(path.join(ctx.profileDir, 'Default', 'Cookies')), true)
+})
+
+test('seedFromGolden refuses to seed a profile for an attached session', async () => {
+  const root = mk(); const ctx = { ...ctxFor(root), attached: true }
+  write(path.join(ctx.goldenDir, 'Default', 'Cookies'), 'golden')
+  let called = false
+  const result = await seedFromGolden(ctx, get('chromium'), { cp: async (...a) => { called = true; return fs.promises.cp(...a) } })
+  assert.equal(result, 'skipped')
+  assert.equal(called, false, "copyProfile's cp must never be invoked for an attached session")
+  assert.equal(fs.existsSync(ctx.profileDir), false)
+})
+
+test('promote refuses to touch the profile or golden directories for an attached session', async () => {
+  const root = mk(); const ctx = { ...ctxFor(root), attached: true }
+  write(path.join(ctx.profileDir, 'Default', 'Cookies'), 'c')
+  let renameCalled = false
+  const res = await promote(ctx, get('chromium'), { rename: async (...a) => { renameCalled = true; return fs.promises.rename(...a) } })
+  assert.equal(res.ok, false)
+  assert.match(res.error, /attached/)
+  assert.equal(renameCalled, false, 'rename must never be invoked for an attached session')
+  assert.equal(fs.existsSync(ctx.goldenDir), false)
+})
+
+test('sweepStale never removes an attached session\'s own directory, listed or not', async () => {
+  const root = mk()
+  const ctx = { ...ctxFor(root), attached: true, ttlDays: 0 }
+  setAttached(ctx, 'chrome')
+  // ttlDays: 0 and rows: [] (not listed) are exactly the conditions that
+  // would otherwise mark this directory as stale and remove it.
+  const removed = await sweepStale(ctx, { rows: [] })
+  assert.equal(removed, 0)
+  assert.equal(fs.existsSync(attachedMarkerPath(ctx)), true)
+})
+
+test('setAttached / attachedMarkerPath / clearAttached round-trip', () => {
+  const root = mk(); const ctx = ctxFor(root)
+  assert.equal(fs.existsSync(attachedMarkerPath(ctx)), false)
+  setAttached(ctx, 'chrome')
+  assert.equal(fs.readFileSync(attachedMarkerPath(ctx), 'utf8').trim(), 'chrome')
+  clearAttached(ctx)
+  assert.equal(fs.existsSync(attachedMarkerPath(ctx)), false)
 })
