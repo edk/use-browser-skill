@@ -1,5 +1,14 @@
 # pwx Node Port Implementation Plan
 
+> **Historical record.** This document records the plan as written before
+> execution. Execution superseded parts of it — notably an environment
+> variable alias that was deliberately removed for safety, and a
+> rendered-text `list` output parser (and its tests) that were deleted in
+> favor of parsing the CLI's `--json` output. It is kept as-is rather than
+> rewritten. `docs/2026-09-08-pwx-node-port-design.md` and the shipped code
+> in `bin/` and `lib/` are authoritative; do not reintroduce anything this
+> document describes that the code no longer does.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Port `bin/pw` (bash, Chromium, macOS only) to Node as `pwx`, running Chromium and Firefox on macOS, Ubuntu, and native Windows 10, with the same command surface.

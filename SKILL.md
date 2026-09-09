@@ -51,6 +51,32 @@ report confident nonsense about it.
   browser on the machine, including other agents'. Do not use `--all` unless
   the user asks for a machine-wide reset.
 
+## Browser choice: chromium or firefox
+
+`pw` drives Chromium by default. Pass `--browser firefox` on `pw open` (or
+`pw fresh`), or set the environment variable `PW_BROWSER=firefox`, to use
+Firefox instead. Neither flag names a running browser: both only choose
+what a new session launches.
+
+- One browser per session. The first `pw open` in a session records the
+  browser it launched. `pw open`, `pw fresh`, and `pw promote` refuse if a
+  later `--browser` or `PW_BROWSER` names a different browser than the one
+  recorded, telling you to switch first (see below); they will not
+  silently act on a profile built for the other browser. Every other
+  command does not carry this guard, so do not pass `--browser` or set
+  `PW_BROWSER` on them at all once a session has a recorded browser: it
+  will not switch anything, and a mismatched value just fails to match
+  the profile and running browser that command is actually looking at.
+  Simplest: pass `--browser` only on a session's first `pw open`, never
+  again after that.
+- Switching a session to the other browser needs a clean slate: `pw end`,
+  then `pw forget`, then open again with the new `--browser` value.
+- Golden profiles are per browser and per machine. `pw promote` saves this
+  session's logins into a golden profile scoped to the browser you were
+  using; a Chromium golden profile never seeds a Firefox session, or the
+  reverse. Golden profiles are also never shared between machines: each
+  machine builds its own, for each browser it uses.
+
 ## Visible by default — pw hide / pw show
 
 The browser opens as a normal visible window so the human can watch. Switch

@@ -1,0 +1,636 @@
+#!/usr/bin/env bash
+# pw-switch — install, revert, and inspect which pw implementation is live.
+#
+# Two implementations of `pw` live side by side in this repo:
+#   bin/pw     the original bash tool. Chromium only, macOS only.
+#              State: ~/.cache/pw-cli — NEVER written by this script.
+#   bin/pwx.js the Node port. Chromium + Firefox, macOS/Linux/Windows.
+#              State: ~/.cache/pwx
+#
+# `~/.local/bin/pw` is a symlink; this script only ever repoints that one
+# symlink (plus creates pw-legacy and pwx alongside it). It never touches
+# ~/.cache/pw-cli, the old tool's saved-login store — that is the entire
+# revert guarantee. See install()/revert()/seed() below.
+set -u
+
+# ---------------------------------------------------------------------------
+# Path resolution — must work when invoked through a symlink (e.g. if this
+# script itself is ever linked onto PATH), so resolve our own real location
+# rather than trusting $0 directly.
+# ---------------------------------------------------------------------------
+resolve_path() {
+  local src="$1" dir
+  while [ -h "$src" ]; do
+    dir="$(cd -P "$(dirname "$src")" && pwd)"
+    src="$(readlink "$src")"
+    case "$src" in /*) ;; *) src="$dir/$src" ;; esac
+  done
+  cd -P "$(dirname "$src")" && pwd
+}
+
+SELF="${BASH_SOURCE[0]:-$0}"
+SCRIPT_DIR="$(resolve_path "$SELF")"
+REPO_DIR="$(cd -P "$SCRIPT_DIR/.." && pwd)"
+
+BASH_TOOL="$REPO_DIR/bin/pw"
+NODE_TOOL="$REPO_DIR/bin/pwx.js"
+
+LOCAL_BIN="$HOME/.local/bin"
+PW_LINK="$LOCAL_BIN/pw"
+PW_LEGACY_LINK="$LOCAL_BIN/pw-legacy"
+PWX_LINK="$LOCAL_BIN/pwx"
+
+OLD_STATE="$HOME/.cache/pw-cli"
+NEW_STATE="$HOME/.cache/pwx"
+
+# pw-switch's own bookkeeping. Deliberately NOT inside either tool's state
+# dir: OLD_STATE must never be written to, and NEW_STATE is the node tool's
+# own data, not this script's.
+SWITCH_STATE_DIR="$HOME/.cache/pw-switch"
+SWITCH_RECORD="$SWITCH_STATE_DIR/pw-pointed-at"
+
+SKILL_LINK="$HOME/.claude/skills/use-browser"
+MIN_NODE_MAJOR=20
+
+MODE="direct"   # "menu" enables interactive confirmation prompts
+FORCE=0
+DEST_OVERRIDE=""
+
+# ---------------------------------------------------------------------------
+# Output helpers
+# ---------------------------------------------------------------------------
+info() { printf 'pw-switch: %s\n' "$*"; }
+ok()   { printf 'pw-switch: [ok] %s\n' "$*"; }
+err()  { printf 'pw-switch: [error] %s\n' "$*" >&2; }
+warn() { printf 'pw-switch: [warn] %s\n' "$*" >&2; }
+
+confirm() {
+  [ "$MODE" = "menu" ] || return 0
+  local reply
+  printf 'pw-switch: %s [y/N] ' "$1"
+  read -r reply
+  case "$reply" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+}
+
+# ---------------------------------------------------------------------------
+# Helpers shared across subcommands
+# ---------------------------------------------------------------------------
+
+dir_has_content() {
+  [ -d "$1" ] || return 1
+  [ -n "$(ls -A "$1" 2>/dev/null)" ]
+}
+
+dir_size() {
+  [ -d "$1" ] || { printf 'missing'; return; }
+  du -sh "$1" 2>/dev/null | awk '{print $1}'
+}
+
+# Print PIDs of any process whose command line references a path under $1.
+# Coarse on purpose: it must catch a live Chromium OR Firefox process holding
+# any profile anywhere under the given state tree, not just one exact profile
+# dir. A false positive just makes install/seed refuse and ask the owner to
+# close the browser; a false negative would strand a live browser mid-switch,
+# which is the failure this exists to prevent.
+#
+# The ps snapshot is captured into a variable BEFORE grepping/awking over it,
+# so the awk process's own argv (which contains the needle) never shows up
+# in the text being searched.
+state_dir_live_pids() {
+  local dir="$1" real snapshot
+  [ -d "$dir" ] || return 0
+  real="$(cd "$dir" 2>/dev/null && pwd)" || return 0
+  [ -n "$real" ] || return 0
+  snapshot="$(ps -axww -o pid=,command= 2>/dev/null || true)"
+  printf '%s\n' "$snapshot" | PW_SWITCH_NEEDLE="$real" awk '
+    BEGIN { n = ENVIRON["PW_SWITCH_NEEDLE"] }
+    index($0, n) > 0 { print $1 }
+  '
+}
+
+live_pids_both() {
+  { state_dir_live_pids "$OLD_STATE"; state_dir_live_pids "$NEW_STATE"; } | sort -u
+}
+
+node_major_version() {
+  command -v node >/dev/null 2>&1 || { printf ''; return; }
+  node --version 2>/dev/null | sed 's/^v//' | cut -d. -f1
+}
+
+# What does $PW_LINK currently resolve to, in plain terms?
+pw_resolution() {
+  if [ ! -e "$PW_LINK" ] && [ ! -L "$PW_LINK" ]; then
+    printf 'missing'
+    return
+  fi
+  if [ -L "$PW_LINK" ]; then
+    local target resolved
+    target="$(readlink "$PW_LINK")"
+    case "$target" in
+      /*) resolved="$target" ;;
+      *) resolved="$LOCAL_BIN/$target" ;;
+    esac
+    # Canonicalize both sides so a relative-vs-absolute spelling of the same
+    # file still matches.
+    local resolved_real bash_real node_real
+    resolved_real="$(cd -P "$(dirname "$resolved")" 2>/dev/null && pwd)/$(basename "$resolved")"
+    bash_real="$BASH_TOOL"
+    node_real="$NODE_TOOL"
+    if [ "$resolved_real" = "$bash_real" ]; then
+      printf 'bash (%s)' "$BASH_TOOL"
+    elif [ "$resolved_real" = "$node_real" ]; then
+      printf 'node (%s)' "$NODE_TOOL"
+    else
+      printf 'unknown -> %s' "$target"
+    fi
+  else
+    printf 'not a symlink (%s)' "$PW_LINK"
+  fi
+}
+
+# Determine what, if anything, install must do to the skill symlink.
+# Sets SKILL_PLAN to one of: ok | create | relink | refuse, and
+# SKILL_PLAN_DETAIL to a human description, so the caller can fold this into
+# one combined confirmation instead of a separate prompt per sub-step.
+plan_skill_symlink() {
+  SKILL_PLAN=""
+  SKILL_PLAN_DETAIL=""
+  if [ -L "$SKILL_LINK" ]; then
+    local target resolved
+    target="$(readlink "$SKILL_LINK")"
+    case "$target" in
+      /*) resolved="$target" ;;
+      *) resolved="$(dirname "$SKILL_LINK")/$target" ;;
+    esac
+    resolved="$(cd -P "$resolved" 2>/dev/null && pwd || echo "$resolved")"
+    if [ "$resolved" = "$REPO_DIR" ]; then
+      SKILL_PLAN="ok"
+      SKILL_PLAN_DETAIL="$SKILL_LINK already points at this repo. Nothing to do."
+    else
+      SKILL_PLAN="relink"
+      SKILL_PLAN_DETAIL="$SKILL_LINK currently -> $target (not this repo). Will back it up, then link it here."
+    fi
+  elif [ -e "$SKILL_LINK" ]; then
+    SKILL_PLAN="refuse"
+    SKILL_PLAN_DETAIL="$SKILL_LINK exists and is not a symlink — looks like an unrelated installation (a real directory or file). Refusing to touch it; move it aside yourself first if you want this repo's skill installed there."
+  else
+    SKILL_PLAN="create"
+    SKILL_PLAN_DETAIL="$SKILL_LINK does not exist, so the skill is not installed for any Claude session. Will create it."
+  fi
+}
+
+# Perform whatever plan_skill_symlink decided. Only called for plans that
+# change something (create/relink); "ok" and "refuse" are handled by the
+# caller before this runs.
+apply_skill_symlink() {
+  case "$SKILL_PLAN" in
+    create)
+      mkdir -p "$(dirname "$SKILL_LINK")"
+      ln -sfn "$REPO_DIR" "$SKILL_LINK"
+      ok "$SKILL_LINK -> $REPO_DIR (created)"
+      ;;
+    relink)
+      local old_target backup
+      old_target="$(readlink "$SKILL_LINK")"
+      backup="${SKILL_LINK}.bak.$(date +%s)"
+      mv "$SKILL_LINK" "$backup"
+      ln -sfn "$REPO_DIR" "$SKILL_LINK"
+      ok "moved $SKILL_LINK -> $backup (was pointing at $old_target)"
+      ok "$SKILL_LINK -> $REPO_DIR"
+      ;;
+  esac
+}
+
+record_pw_target() {
+  mkdir -p "$SWITCH_STATE_DIR"
+  chmod 700 "$SWITCH_STATE_DIR" 2>/dev/null || true
+  if [ -L "$PW_LINK" ]; then
+    readlink "$PW_LINK" > "$SWITCH_RECORD"
+  elif [ -e "$PW_LINK" ]; then
+    printf 'NOTLINK:%s\n' "$PW_LINK" > "$SWITCH_RECORD"
+  else
+    printf 'NONE\n' > "$SWITCH_RECORD"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# status
+# ---------------------------------------------------------------------------
+cmd_status() {
+  local res node_ver node_major node_ok node_modules_ok pwx_on_path skill_ok
+  res="$(pw_resolution)"
+
+  case "$res" in
+    bash\ *) printf 'pw resolves to: BASH (legacy tool)\n' ;;
+    node\ *) printf 'pw resolves to: NODE (pwx port)\n' ;;
+    missing) printf 'pw resolves to: (nothing — %s does not exist)\n' "$PW_LINK" ;;
+    *) printf 'pw resolves to: %s\n' "$res" ;;
+  esac
+  printf '  target: %s\n' "$res"
+
+  if command -v pwx >/dev/null 2>&1; then
+    pwx_on_path="yes ($(command -v pwx))"
+  else
+    pwx_on_path="no"
+  fi
+  printf 'pwx on PATH: %s\n' "$pwx_on_path"
+
+  node_ver="$(node --version 2>/dev/null || echo 'not found')"
+  node_major="$(node_major_version)"
+  if [ -n "$node_major" ] && [ "$node_major" -ge "$MIN_NODE_MAJOR" ] 2>/dev/null; then
+    node_ok="meets minimum ($MIN_NODE_MAJOR)"
+  else
+    node_ok="below minimum ($MIN_NODE_MAJOR) or not found"
+  fi
+  printf 'node: %s — %s\n' "$node_ver" "$node_ok"
+
+  if [ -d "$REPO_DIR/node_modules" ]; then
+    node_modules_ok="present"
+  else
+    node_modules_ok="MISSING — run: pw-switch deps"
+  fi
+  printf 'repo node_modules: %s\n' "$node_modules_ok"
+
+  printf 'installed playwright browsers:\n'
+  local browsers_root=""
+  if [ -n "${PLAYWRIGHT_BROWSERS_PATH:-}" ]; then
+    browsers_root="$PLAYWRIGHT_BROWSERS_PATH"
+  elif [ -d "$HOME/Library/Caches/ms-playwright" ]; then
+    browsers_root="$HOME/Library/Caches/ms-playwright"
+  elif [ -d "$HOME/.cache/ms-playwright" ]; then
+    browsers_root="$HOME/.cache/ms-playwright"
+  fi
+  if [ -n "$browsers_root" ] && [ -d "$browsers_root" ]; then
+    if ls "$browsers_root" 2>/dev/null | grep -q '^chromium-'; then
+      printf '  chromium: yes\n'
+    else
+      printf '  chromium: no\n'
+    fi
+    if ls "$browsers_root" 2>/dev/null | grep -q '^firefox-'; then
+      printf '  firefox: yes\n'
+    else
+      printf '  firefox: no\n'
+    fi
+  else
+    printf '  (browsers cache dir not found)\n'
+  fi
+
+  if [ -L "$SKILL_LINK" ]; then
+    local skill_target skill_real
+    skill_target="$(readlink "$SKILL_LINK")"
+    case "$skill_target" in
+      /*) skill_real="$skill_target" ;;
+      *) skill_real="$(dirname "$SKILL_LINK")/$skill_target" ;;
+    esac
+    skill_real="$(cd -P "$skill_real" 2>/dev/null && pwd || echo "$skill_real")"
+    if [ "$skill_real" = "$REPO_DIR" ]; then
+      skill_ok="yes -> $REPO_DIR"
+    else
+      skill_ok="NO — points at $skill_target instead"
+    fi
+  elif [ -e "$SKILL_LINK" ]; then
+    skill_ok="NO — exists but is not a symlink (looks like an unrelated installation)"
+  else
+    skill_ok="NO — not installed for Claude sessions ($SKILL_LINK does not exist)"
+  fi
+  printf '%s points at this repo: %s\n' "$SKILL_LINK" "$skill_ok"
+
+  printf 'state directories:\n'
+  printf '  %s (old/bash, read-only to this tool): %s\n' "$OLD_STATE" "$(dir_size "$OLD_STATE")"
+  printf '  %s (new/node): %s\n' "$NEW_STATE" "$(dir_size "$NEW_STATE")"
+
+  if dir_has_content "$OLD_STATE/golden"; then
+    printf 'bash tool saved-login profile: yes (%s/golden)\n' "$OLD_STATE"
+  else
+    printf 'bash tool saved-login profile: no\n'
+  fi
+  if dir_has_content "$NEW_STATE/golden/chromium"; then
+    printf 'node tool saved-login profile (chromium): yes (%s/golden/chromium)\n' "$NEW_STATE"
+  else
+    printf 'node tool saved-login profile (chromium): no\n'
+  fi
+  if dir_has_content "$NEW_STATE/golden/firefox"; then
+    printf 'node tool saved-login profile (firefox): yes (%s/golden/firefox)\n' "$NEW_STATE"
+  else
+    printf 'node tool saved-login profile (firefox): no\n'
+  fi
+
+  if [ -s "$SWITCH_RECORD" ]; then
+    printf 'recorded pre-install target (for revert): %s\n' "$(cat "$SWITCH_RECORD")"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# install
+# ---------------------------------------------------------------------------
+cmd_install() {
+  if [ ! -f "$NODE_TOOL" ]; then
+    err "$NODE_TOOL not found — repo looks broken or misplaced."
+    return 1
+  fi
+  if [ ! -f "$BASH_TOOL" ]; then
+    err "$BASH_TOOL not found — repo looks broken or misplaced."
+    return 1
+  fi
+
+  local node_major
+  node_major="$(node_major_version)"
+  if [ -z "$node_major" ]; then
+    err "node not found on PATH. Install Node >= $MIN_NODE_MAJOR first. Refusing to install."
+    return 1
+  fi
+  if ! [ "$node_major" -ge "$MIN_NODE_MAJOR" ] 2>/dev/null; then
+    err "node $(node --version 2>/dev/null) found; pwx needs >= $MIN_NODE_MAJOR. Refusing to install."
+    return 1
+  fi
+
+  if [ ! -d "$REPO_DIR/node_modules" ]; then
+    err "$REPO_DIR/node_modules is missing. Run: pw-switch deps"
+    return 1
+  fi
+
+  local live
+  live="$(live_pids_both)"
+  if [ -n "$live" ]; then
+    err "browser process(es) live against pw-cli or pwx state (pid: $(printf '%s' "$live" | tr '\n' ' ')). Close the browser before switching, or switching strands it."
+    return 1
+  fi
+
+  # The skill symlink is what makes the switch actually matter: without it,
+  # no Claude session ever runs bin/pwx.js regardless of what pw resolves to.
+  # A fresh machine needs this created. A "refuse" plan (a real directory or
+  # file sitting at $SKILL_LINK) does NOT abort the whole install, though —
+  # that's a separate installation of the skill that must not be touched,
+  # but pw/pw-legacy/pwx switching is independent of it and should still
+  # happen; the owner just needs to be told plainly, both now and again
+  # after the switch, that the skill directory was left alone.
+  plan_skill_symlink
+  if [ "$SKILL_PLAN" = "refuse" ]; then
+    err "$SKILL_PLAN_DETAIL"
+  else
+    info "$SKILL_PLAN_DETAIL"
+  fi
+
+  info "About to point pw -> $NODE_TOOL, create pw-legacy -> $BASH_TOOL, and pwx -> $NODE_TOOL."
+  confirm "Proceed with install?" || { info "Aborted."; return 1; }
+
+  if [ "$SKILL_PLAN" != "refuse" ]; then
+    apply_skill_symlink
+  fi
+
+  mkdir -p "$LOCAL_BIN"
+  record_pw_target
+  ln -sfn "$NODE_TOOL" "$PW_LINK"
+  ln -sfn "$BASH_TOOL" "$PW_LEGACY_LINK"
+  ln -sfn "$NODE_TOOL" "$PWX_LINK"
+
+  ok "pw         -> $NODE_TOOL (node)"
+  ok "pw-legacy  -> $BASH_TOOL (bash, always directly runnable)"
+  ok "pwx        -> $NODE_TOOL"
+  if [ "$SKILL_PLAN" = "refuse" ]; then
+    warn "$SKILL_LINK was left alone (see error above) — a real directory or file is there, not a symlink. Claude sessions will keep using whatever is at that path, not this repo, until you move it aside and re-run install."
+  fi
+  info "Revert any time with: pw-switch revert"
+}
+
+# ---------------------------------------------------------------------------
+# revert — must be bulletproof: no Node, no dependency on repo or state-dir
+# condition beyond bin/pw itself existing. Never touches either state dir.
+# ---------------------------------------------------------------------------
+cmd_revert() {
+  if [ ! -f "$BASH_TOOL" ]; then
+    err "$BASH_TOOL not found. Cannot revert — repo looks broken or misplaced."
+    return 1
+  fi
+
+  local target="$BASH_TOOL"
+  if [ -s "$SWITCH_RECORD" ]; then
+    local rec
+    rec="$(cat "$SWITCH_RECORD" 2>/dev/null || true)"
+    case "$rec" in
+      NONE|NOTLINK:*|'') target="$BASH_TOOL" ;;
+      /*) [ -e "$rec" ] && target="$rec" ;;
+      *)
+        local candidate="$LOCAL_BIN/$rec"
+        [ -e "$candidate" ] && target="$rec"
+        ;;
+    esac
+  fi
+
+  info "About to point pw -> $target"
+  confirm "Proceed with revert?" || { info "Aborted."; return 1; }
+
+  mkdir -p "$LOCAL_BIN"
+  ln -sfn "$target" "$PW_LINK"
+
+  ok "pw -> $(readlink "$PW_LINK")"
+  info "State directories untouched: $OLD_STATE and $NEW_STATE"
+}
+
+# ---------------------------------------------------------------------------
+# seed — copy old tool's saved Chromium logins into the new tool's golden
+# profile. Source is read-only, always.
+# ---------------------------------------------------------------------------
+PROFILE_SKIP="Default/Cache
+Default/Code Cache
+Default/Service Worker
+Default/GPUCache
+Default/DawnWebGPUCache
+Default/DawnGraphiteCache
+Default/Shared Dictionary
+Default/Sessions
+Default/History
+GraphiteDawnCache
+GPUPersistentCache
+component_crx_cache"
+
+cmd_seed() {
+  local src="$OLD_STATE/golden"
+  local dest="${DEST_OVERRIDE:-$NEW_STATE/golden/chromium}"
+
+  if [ -z "$dest" ]; then
+    err "destination path resolved empty — refusing to proceed."
+    return 1
+  fi
+
+  if ! dir_has_content "$src"; then
+    err "$src has no saved logins — nothing to seed."
+    return 1
+  fi
+
+  if dir_has_content "$dest" && [ "$FORCE" != "1" ]; then
+    err "$dest already has content. Re-run with --force to overwrite."
+    return 1
+  fi
+
+  local live
+  live="$(live_pids_both)"
+  if [ -n "$live" ]; then
+    err "browser process(es) live against pw-cli or pwx state (pid: $(printf '%s' "$live" | tr '\n' ' ')). Close the browser before seeding."
+    return 1
+  fi
+
+  info "About to copy $src -> $dest (Chromium logins only, caches excluded)."
+  confirm "Proceed with seed?" || { info "Aborted."; return 1; }
+
+  (umask 077 && mkdir -p "$dest") || { err "could not create $dest"; return 1; }
+
+  if command -v rsync >/dev/null 2>&1; then
+    local args=()
+    while IFS= read -r rel; do
+      [ -n "$rel" ] && args+=(--exclude "/$rel")
+    done <<EOF
+$PROFILE_SKIP
+EOF
+    if ! rsync -a "${args[@]}" "$src/" "$dest/"; then
+      err "rsync copy failed."
+      return 1
+    fi
+  else
+    if ! cp -R "$src/." "$dest/"; then
+      err "cp copy failed."
+      return 1
+    fi
+    while IFS= read -r rel; do
+      [ -n "$rel" ] && [ -n "$dest" ] && rm -rf "${dest:?}/${rel:?}"
+    done <<EOF
+$PROFILE_SKIP
+EOF
+  fi
+
+  rm -f "$dest/SingletonLock" "$dest/SingletonSocket" "$dest/SingletonCookie" 2>/dev/null || true
+  chmod -R go-rwx "$dest" 2>/dev/null || true
+
+  ok "Seeded $dest from $src."
+  info "This copied Chromium logins only. Firefox keeps a separate profile and needs its own logins."
+}
+
+# ---------------------------------------------------------------------------
+# deps
+# ---------------------------------------------------------------------------
+cmd_deps() {
+  info "About to run npm install in $REPO_DIR and install Chromium + Firefox via playwright-cli."
+  confirm "Proceed?" || { info "Aborted."; return 1; }
+
+  info "npm install ($REPO_DIR)"
+  if ! ( cd "$REPO_DIR" && npm install ); then
+    err "npm install failed."
+    return 1
+  fi
+
+  local cli="$REPO_DIR/node_modules/@playwright/cli/playwright-cli.js"
+  if [ ! -f "$cli" ]; then
+    err "$cli not found after npm install."
+    return 1
+  fi
+
+  info "installing chromium"
+  if ! node "$cli" install-browser chromium; then
+    err "chromium install failed."
+    return 1
+  fi
+
+  info "installing firefox"
+  if ! node "$cli" install-browser firefox; then
+    err "firefox install failed."
+    return 1
+  fi
+
+  ok "Dependencies installed. This machine is ready for: pw-switch install"
+}
+
+# ---------------------------------------------------------------------------
+# usage / menu
+# ---------------------------------------------------------------------------
+usage() {
+  cat <<EOF
+pw-switch — install/revert between the bash pw and the Node pwx port
+
+Usage:
+  pw-switch                 interactive menu
+  pw-switch status          show which implementation pw resolves to (default view)
+  pw-switch install         point pw at the Node tool; create pw-legacy and pwx
+  pw-switch revert          point pw back at the bash tool (fast, no Node needed)
+  pw-switch seed [--force] [--dest DIR]
+                             copy old tool's saved Chromium logins into the new
+                             tool's golden profile
+  pw-switch deps            npm install + install Chromium and Firefox browsers
+  pw-switch help            this text
+
+Never writes to $OLD_STATE — that is the revert guarantee.
+EOF
+}
+
+run_menu() {
+  MODE="menu"
+  while true; do
+    echo
+    echo "pw-switch menu:"
+    echo "  1) status"
+    echo "  2) install (switch pw to the node tool)"
+    echo "  3) revert  (switch pw back to the bash tool)"
+    echo "  4) seed    (copy old logins into the new tool)"
+    echo "  5) deps    (npm install + install browsers)"
+    echo "  6) quit"
+    printf 'choose 1-6: '
+    local choice
+    read -r choice
+    case "$choice" in
+      1) cmd_status ;;
+      2) cmd_install ;;
+      3) cmd_revert ;;
+      4) cmd_seed ;;
+      5) cmd_deps ;;
+      6) return 0 ;;
+      *) echo "pw-switch: not a valid choice" ;;
+    esac
+  done
+}
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+main() {
+  local cmd="${1:-}"
+  [ -n "$cmd" ] && shift
+
+  case "$cmd" in
+    ""|menu)
+      run_menu
+      ;;
+    status)
+      MODE="direct"; cmd_status
+      ;;
+    install)
+      MODE="direct"; cmd_install
+      ;;
+    revert)
+      MODE="direct"; cmd_revert
+      ;;
+    seed)
+      MODE="direct"
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --force) FORCE=1 ;;
+          --dest) shift; DEST_OVERRIDE="${1:-}" ;;
+          *) err "unknown seed option: $1"; usage; return 1 ;;
+        esac
+        shift
+      done
+      cmd_seed
+      ;;
+    deps)
+      MODE="direct"; cmd_deps
+      ;;
+    help|-h|--help)
+      usage
+      ;;
+    *)
+      err "unknown subcommand: $cmd"
+      usage
+      return 1
+      ;;
+  esac
+}
+
+main "$@"
