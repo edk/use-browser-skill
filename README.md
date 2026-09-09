@@ -225,6 +225,17 @@ session's browser is not pwx's to launch, seed, or kill, so:
 - `pwx status` and `pwx gc` report the attached state instead of profile and
   golden paths that do not apply.
 
+There is exactly one real browser to attach to, so unlike a launched
+browser's session (named per agent, from `CLAUDE_CODE_SESSION_ID`), every
+attached connection uses one fixed, reserved playwright-cli session name,
+`pwx-attached`, regardless of which agent enters attach mode. That is what
+lets a second Claude session join the same connection with `pwx attach` and
+no flags to pass: `pwx attach` checks whether `pwx-attached` is already
+connected and, if so, joins it instead of opening a second connection (and a
+second connect-page tab). Because the connection is shared, `pwx end` from
+any joined session disconnects all of them — it still only ever detaches,
+never closes or kills the browser itself.
+
 ### Running the test suites
 
 ```bash
