@@ -184,9 +184,13 @@ test('open refuses to launch a browser of its own for a disconnected attached se
   assert.ok(!r.calls.some(c => c.argv.includes('open')), 'must never launch a browser of its own for an attached session')
 })
 
-// --- end detaches the SHARED connection; never closes/kills ---
+// --- end is inert while attached; only the explicit detach tears down ---
+//
+// SKILL.md trains agents to run 'end' when they finish a task. The attach
+// connection is shared by every Claude session, so an 'end' that detached
+// would disconnect other sessions mid-task. It must do nothing instead.
 
-test('end in attach mode detaches, never closes or captures, and clears this agent\'s marker', async () => {
+test('end in attach mode does nothing at all: no detach, no close, no capture, marker intact', async () => {
   const root = mkroot()
   markAttached(root, 'chrome')
   // A stray profile directory should not matter: attach mode must never look
@@ -194,28 +198,52 @@ test('end in attach mode detaches, never closes or captures, and clears this age
   write(path.join(root, 'sessions', 'sess1', 'profile', 'Default', 'Cookies'), 'c')
   const r = await runIn(root, ['end'], { PW_STUB_LIST: listFile(root, [sharedRow()]) })
   assert.equal(r.code, 0, r.stderr)
+  assert.ok(!r.calls.some(c => c.argv.includes('detach')), 'end must not detach a shared connection other sessions may be using')
+  assert.ok(!r.calls.some(c => c.argv.includes('close')), 'end must not close an attached session')
+  assert.ok(!r.calls.some(c => c.argv.includes('state-save')), 'end must not capture storage state for an attached session')
+  assert.equal(fs.existsSync(markerFor(root)), true, 'the attached marker must survive, so the next open still joins the shared connection')
+  assert.equal(fs.existsSync(path.join(root, 'sessions', 'sess1', 'profile', 'Default', 'Cookies')), true, 'a stray profile must be left alone')
+  assert.match(r.stdout, /nothing to close/)
+  assert.match(r.stdout, /pwx detach/)
+})
+
+test('end in attach mode says the shared connection stays up for other sessions', async () => {
+  const root = mkroot()
+  markAttached(root, 'chrome')
+  const r = await runIn(root, ['end'], { PW_STUB_LIST: listFile(root, [sharedRow()]) })
+  assert.match(r.stdout, /shared connection stays up/)
+})
+
+// --- detach is the explicit teardown of the SHARED connection ---
+
+test('detach in attach mode detaches the shared session, clears the marker, and never closes or captures', async () => {
+  const root = mkroot()
+  markAttached(root, 'chrome')
+  write(path.join(root, 'sessions', 'sess1', 'profile', 'Default', 'Cookies'), 'c')
+  const r = await runIn(root, ['detach'], { PW_STUB_LIST: listFile(root, [sharedRow()]) })
+  assert.equal(r.code, 0, r.stderr)
   const detachCall = r.calls.find(c => c.argv.includes('detach'))
   assert.ok(detachCall, `expected a detach call; got ${JSON.stringify(r.calls.map(c => c.argv))}`)
   assert.ok(detachCall.argv.includes(`-s=${ATTACH_SESSION_NAME}`), 'must detach the shared session, not a per-agent name')
-  assert.ok(!r.calls.some(c => c.argv.includes('close')), 'end must not close an attached session')
-  assert.ok(!r.calls.some(c => c.argv.includes('state-save')), 'end must not capture storage state for an attached session')
+  assert.ok(!r.calls.some(c => c.argv.includes('close')), 'detach must not close an attached session')
+  assert.ok(!r.calls.some(c => c.argv.includes('state-save')), 'detach must not capture storage state for an attached session')
   assert.equal(fs.existsSync(markerFor(root)), false, 'the attached marker must be cleared')
   assert.equal(fs.existsSync(path.join(root, 'sessions', 'sess1', 'profile', 'Default', 'Cookies')), true, 'a stray profile must be left alone')
   assert.match(r.stdout, /detached the shared attach connection/)
   assert.match(r.stdout, /untouched and still running/)
 })
 
-test('end in attach mode says plainly that it disconnects a shared connection other sessions may be using', async () => {
+test('detach says plainly that it disconnects a shared connection other sessions may be using', async () => {
   const root = mkroot()
   markAttached(root, 'chrome')
-  const r = await runIn(root, ['end'], { PW_STUB_LIST: listFile(root, [sharedRow()]) })
-  assert.match(r.stdout, /if another Claude session had joined it, that session is disconnected too/)
+  const r = await runIn(root, ['detach'], { PW_STUB_LIST: listFile(root, [sharedRow()]) })
+  assert.match(r.stdout, /any other Claude session that had joined it is disconnected too/)
 })
 
-test('end in attach mode still clears the marker and reports success even when detach itself fails', async () => {
+test('detach still clears the marker and reports success even when detach itself fails', async () => {
   const root = mkroot()
   markAttached(root, 'chrome')
-  const r = await runIn(root, ['end'], { PW_STUB_LIST: listFile(root, []), PW_STUB_FAIL_VERBS: 'detach' })
+  const r = await runIn(root, ['detach'], { PW_STUB_LIST: listFile(root, []), PW_STUB_FAIL_VERBS: 'detach' })
   assert.equal(r.code, 0)
   assert.equal(fs.existsSync(markerFor(root)), false)
   assert.match(r.stderr, /your browser was not touched either way/)

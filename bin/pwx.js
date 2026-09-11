@@ -189,7 +189,7 @@ async function main () {
   }
 
   if (ctx.attached && ATTACH_LOCKED.has(cmd)) {
-    die(`session '${ctx.session}' is attached to your real ${ctx.attachedChannel} browser — '${cmd}' assumes pwx owns the browser and its profile, which isn't true here. 'pwx end' detaches (your browser stays open and untouched); 'pwx status' shows the attached state.`)
+    die(`session '${ctx.session}' is attached to your real ${ctx.attachedChannel} browser — '${cmd}' assumes pwx owns the browser and its profile, which isn't true here. 'pwx detach' disconnects on purpose (your browser stays open and untouched); 'pwx status' shows the attached state.`)
   }
 
   if (!READ_ONLY.has(cmd)) session.touchLastUsed(ctx)
@@ -245,22 +245,19 @@ async function main () {
       return
 
     case 'end':
-      // An attached session's browser is the owner's real one, holding every
-      // account they are signed into. 'end' must detach and leave it running
-      // and untouched — never capture/close/kill, which all assume pwx owns
-      // the browser it is shutting down. `detach` only tears down pwx's own
-      // extension connection; the browser survives it regardless of outcome,
-      // so a non-zero exit here is reported but still treated as "done".
-      //
-      // The connection it tears down is the single SHARED one every attached
-      // Claude session uses (ctx.session is ATTACH_SESSION_NAME here) — this
-      // disconnects every session that joined it, not just this one, so the
-      // message says that plainly rather than implying a private teardown.
+      // 'end' means "I am done with the browser I was given". For a session
+      // pwx launched, that is a close. For an attached session it is nothing
+      // at all: the browser is the owner's real one, holding every account
+      // they are signed into, and the connection is the single SHARED one
+      // (ctx.session is ATTACH_SESSION_NAME) that every attached Claude
+      // session joins. Tearing that down disconnects other sessions that are
+      // still mid-task, and agents are trained by SKILL.md to call 'end' when
+      // they finish a task, so an 'end' that detached here dropped the
+      // connection out from under whoever else was using it. Detaching is a
+      // deliberate act by the owner, so it lives only in the explicit
+      // 'pwx detach' verb.
       if (ctx.attached) {
-        const r = await engine.run(ctx, ['detach'], { capture: true })
-        session.clearAttached(ctx)
-        if (r.code !== 0) warn(`detach reported a problem (exit ${r.code}) — your browser was not touched either way. 'pwx status' to check.`)
-        say(`detached the shared attach connection — if another Claude session had joined it, that session is disconnected too. Your ${ctx.attachedChannel} browser itself is untouched and still running.`)
+        say(`nothing to close — this session is attached to your real ${ctx.attachedChannel} browser, which pwx does not own. The shared connection stays up for any other Claude session using it. To disconnect on purpose: 'pwx detach'.`)
         return
       }
       await session.captureStorageState(ctx, engine.run)
@@ -358,7 +355,7 @@ async function main () {
         const attachedState = await engine.sessionState(ctx)
         say(attachedState === 'open'
           ? `the shared attach connection '${ctx.session}' is connected — nothing to clean (pwx does not own this browser).`
-          : `this agent (${ctx.ownSession}) is marked attached, but the shared connection '${ctx.session}' is not currently connected — 'pwx attach' to (re)join it, or 'pwx end' to clear the marker. Nothing to reap: pwx does not own this browser.`)
+          : `this agent (${ctx.ownSession}) is marked attached, but the shared connection '${ctx.session}' is not currently connected — 'pwx attach' to (re)join it, or 'pwx detach' to clear the marker. Nothing to reap: pwx does not own this browser.`)
         const attachedRows = await engine.listSessions(ctx)
         const attachedN = await session.sweepStale(ctx, { rows: attachedRows })
         if (attachedN > 0) warn(`reaped ${attachedN} stale session profile(s) (unused > ${ctx.ttlDays}d).`)
@@ -458,7 +455,7 @@ async function main () {
         // Scoped nuke captures, closes, and kills THIS session's own browser
         // and keeps its profile — every part of that assumes pwx owns the
         // browser it is resetting, which isn't true for an attached session.
-        die(`session '${ctx.session}' is attached to your real ${ctx.attachedChannel} browser — there is nothing pwx-owned to reset. 'pwx end' detaches (your browser stays open).`)
+        die(`session '${ctx.session}' is attached to your real ${ctx.attachedChannel} browser — there is nothing pwx-owned to reset. 'pwx detach' disconnects (your browser stays open).`)
       } else {
         await session.captureStorageState(ctx, engine.run)
         await engine.run(ctx, ['close'], { capture: true })
@@ -508,7 +505,7 @@ async function main () {
         // attached and connected. Join it — never open a second connection
         // (and a second connect-page tab) on top of it.
         if (sharedRow.browserType && sharedRow.browserType !== channel) {
-          die(`the shared attach connection is already attached to ${sharedRow.browserType}, not ${channel}. Run 'pwx end' to drop it if you really want to switch, then 'pwx attach ${channel}'.`)
+          die(`the shared attach connection is already attached to ${sharedRow.browserType}, not ${channel}. Run 'pwx detach' to drop it if you really want to switch, then 'pwx attach ${channel}'.`)
         }
         session.setAttached(ctx, sharedRow.browserType || channel)
         say(`joining the existing shared attach connection (${sharedRow.browserType || channel}) — no new connection was opened.`)
@@ -537,14 +534,26 @@ async function main () {
       const r = await engine.run(shared, ['attach', `--extension=${channel}`], { capture: true, env: tokenEnv })
       if (r.code !== 0) die(`attach failed (exit ${r.code}) — your browser was not touched.`)
       session.setAttached(ctx, channel)
-      say(`attached to your real ${channel} browser via the extension, on the shared session '${ATTACH_SESSION_NAME}' — any Claude session can join it with a plain 'pwx attach', no flags to pass. 'pwx end' detaches without closing your browser (and disconnects any other session that had joined it).`)
+      say(`attached to your real ${channel} browser via the extension, on the shared session '${ATTACH_SESSION_NAME}' — any Claude session can join it with a plain 'pwx attach', no flags to pass. 'pwx end' is a no-op while attached, so an agent finishing a task cannot disconnect you; 'pwx detach' is the explicit disconnect and never closes your browser.`)
       return
     }
 
     case 'detach': {
-      const r = await engine.run(ctx, ['detach'])
-      if (ctx.attached) session.clearAttached(ctx)
-      process.exit(r.code)
+      // The explicit, owner-initiated teardown of attach mode, and the only
+      // verb that performs it. It disconnects the SHARED connection, so every
+      // other Claude session that joined it loses the browser too; say so
+      // rather than implying a private teardown. The browser itself survives
+      // regardless of how playwright-cli's own detach exits, so a non-zero
+      // code is reported without pretending the browser is in doubt.
+      const wasAttached = ctx.attached
+      const channel = ctx.attachedChannel
+      const r = await engine.run(ctx, ['detach'], { capture: true })
+      if (wasAttached) session.clearAttached(ctx)
+      if (r.code !== 0) warn(`detach reported a problem (exit ${r.code}) — your browser was not touched either way. 'pwx status' to check.`)
+      say(wasAttached
+        ? `detached the shared attach connection — any other Claude session that had joined it is disconnected too. Your ${channel} browser is untouched and still running. 'pwx attach' to reconnect.`
+        : 'detached (this session was not marked as attached).')
+      return
     }
 
     case 'token': {

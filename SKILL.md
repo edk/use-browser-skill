@@ -51,6 +51,36 @@ report confident nonsense about it.
   browser on the machine, including other agents'. Do not use `--all` unless
   the user asks for a machine-wide reset.
 
+## Attached mode: the browser is the user's own, and it is shared
+
+Some sites (Cloudflare-protected ones such as ChatGPT and Twilio) refuse any
+browser Playwright launched, including real Chrome. For those the user attaches
+`pw` to the Chrome they already have running, through the Playwright Chrome
+extension. Run `pw status` before your first action: if it says ATTACHED, the
+rules below replace the session-discipline rules above.
+
+- The browser is the user's, with every account they are signed into. `pw` does
+  not own it and must never close, kill, or reset it.
+- The connection is SHARED. It has one fixed name and every Claude session joins
+  the same one, so another session may be working in that browser right now.
+- **Never run `pw detach`.** It disconnects every session, not just yours.
+  Disconnecting is the user's decision. `pw end` is deliberately inert while
+  attached, so the ordinary "close when done" habit cannot break anyone.
+- `pw fresh`, `pw promote`, `pw forget`, `pw nuke`, `pw show`, and `pw hide` all
+  refuse while attached. Do not try to work around a refusal.
+- Only tabs in Chrome's "Playwright" tab group are visible to automation. A tab
+  you open with `pw open <url>` joins that group automatically, so navigate
+  rather than asking the user to drag a tab in. Cookies are shared across the
+  whole browser profile, so a site the user is logged into is still logged in on
+  a tab you opened yourself.
+- `pw open <url>` navigates the current tab, which in a browser that is not
+  yours may be something the user was reading. Work in your own tab instead:
+  `pw tab-list` to see the shared tabs, `pw tab-new <url>` to open one,
+  `pw tab-select <n>` to switch, `pw tab-close <n>` to clean up when done.
+  Leave tabs you did not open alone.
+- Finishing up: leave the connection up and say so. Do not offer to close the
+  browser or detach.
+
 ## Browser choice: chromium or firefox
 
 `pw` drives Chromium by default. Pass `--browser firefox` on `pw open` (or
@@ -194,7 +224,7 @@ happen, `pw promote` afterwards spares every future session the same prompt.
 
 When the whole task is done, ask the user whether to keep the browser open or
 close it, e.g.: "Done. Keep the browser window open for follow-ups, or close it
-(`pw end`)?"
+(`pw end`)?" In attached mode, skip this: leave the connection up and say so.
 
 - **Keeping it open** means the next task reuses it instantly; login state is
   safe either way.
@@ -234,7 +264,8 @@ pw hide                         # tuck the browser away (headless background wor
 pw show                         # bring the window back
 pw status                       # your session name + profile, mode, last used, orphans
 pw gc                           # reap your orphans + stale locks + old session profiles
-pw end                          # close browser when task is done (login persists)
+pw end                          # close browser when task is done (login persists;
+                                #   inert while attached — see Attached mode)
 pw fresh https://example.com    # force a NEW browser (rare, clean slate only)
 pw promote                      # after 'pw end': save logins for future sessions
 pw forget                       # clear this session's login (--golden clears the seed)
