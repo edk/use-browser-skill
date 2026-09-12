@@ -1,7 +1,7 @@
 ---
 name: use-browser
 description: Use when driving a web browser to get something done — navigating to a page, clicking, filling or submitting a form, taking a screenshot, scraping or extracting data from a page, logging into a site, or testing a web page. For agent-driven browser automation of any site. Not for shared interactive debugging of your own running app — that is cosession.
-allowed-tools: Bash(pw:*)
+allowed-tools: Bash(pw:*), Bash(pwx:*)
 ---
 
 # use-browser
@@ -12,7 +12,10 @@ all artifacts written outside your repos.
 
 ## The one rule
 
-Use `pw` for all browser work. Never call `playwright-cli` directly. `pw` sets
+Use `pw` for all browser work. Never call `playwright-cli` directly. On a
+machine mid-migration to the Node port, the same tool is also installed as
+`pwx`; everything below applies verbatim to it, so read `pw` as "whichever of
+the two the user is running". Attached mode (below) exists only in `pwx`. `pw` sets
 the mode, the artifact location, the persistent profile, and the session name
 for you. If `pw` is not on PATH, call it at
 `~/.claude/skills/use-browser/bin/pw`.
@@ -63,21 +66,30 @@ rules below replace the session-discipline rules above.
   not own it and must never close, kill, or reset it.
 - The connection is SHARED. It has one fixed name and every Claude session joins
   the same one, so another session may be working in that browser right now.
+- `pw attach` is safe to re-run and does not disturb anything. If the shared
+  connection is already up it joins it, opens no tab, and says "no new
+  connection was opened". Only a cold attach, with no connection anywhere,
+  opens a connect tab for the user to approve. It never drops or hides tabs.
 - **Never run `pw detach`.** It disconnects every session, not just yours.
   Disconnecting is the user's decision. `pw end` is deliberately inert while
   attached, so the ordinary "close when done" habit cannot break anyone.
 - `pw fresh`, `pw promote`, `pw forget`, `pw nuke`, `pw show`, and `pw hide` all
   refuse while attached. Do not try to work around a refusal.
-- Only tabs in Chrome's "Playwright" tab group are visible to automation. A tab
-  you open with `pw open <url>` joins that group automatically, so navigate
-  rather than asking the user to drag a tab in. Cookies are shared across the
-  whole browser profile, so a site the user is logged into is still logged in on
-  a tab you opened yourself.
+- Only tabs in Chrome's "Playwright" tab group are visible to automation. The
+  user's other tabs are not hidden by anything `pw` did; they were never in
+  scope. `pw tab-list` shows the whole of what you can reach, and `pw tab-select`
+  can only pick from that same list, so neither one can get you to a tab outside
+  the group. Do not tell the user otherwise.
+- Two things put a tab in the group: the user drags it in, or automation opened
+  it. A tab you open with `pw open <url>` or `pw tab-new <url>` joins
+  automatically. So when the user names a site, open it yourself rather than
+  asking them to drag a tab over. Cookies are shared across the whole browser
+  profile, so a site they are logged into is still logged in on your tab.
 - `pw open <url>` navigates the current tab, which in a browser that is not
   yours may be something the user was reading. Work in your own tab instead:
-  `pw tab-list` to see the shared tabs, `pw tab-new <url>` to open one,
-  `pw tab-select <n>` to switch, `pw tab-close <n>` to clean up when done.
-  Leave tabs you did not open alone.
+  `pw tab-new <url>` to open one, `pw tab-select <n>` to switch between tabs you
+  can see, `pw tab-close <n>` to clean up when done. Leave tabs you did not
+  open alone, and never drag or ungroup on the user's behalf.
 - Finishing up: leave the connection up and say so. Do not offer to close the
   browser or detach.
 
@@ -307,6 +319,49 @@ When `pw click "some text"` fails with "does not match any elements", the elemen
 3. Use `pw click e42` with the ref, or use `pw --raw eval` with a DOM query to `.click()` it directly.
 
 Do not retry `pw click "text"` with slight text variations — fall back to ref or eval click immediately.
+
+## Uploading a file when `upload` is refused
+
+In attached mode the extension relay rejects the protocol call `upload` depends on:
+
+```
+fileChooser.setFiles: Protocol error (DOM.setFileInputFiles): {"code":-32000,"message":"Not allowed"}
+```
+
+Once the native picker is open, `eval` is blocked too — every call returns `Tool
+"browser_evaluate" does not handle the modal state`. Clear it with `pw press Escape`
+before doing anything else.
+
+The way through is to intercept the page's own call to `.click()` on its file input, so
+the native picker never opens. Install the hook BEFORE triggering the upload:
+
+```js
+window.__f = new File([bytes], "name.csv", {type:"text/csv"});
+window.__orig = HTMLInputElement.prototype.click;
+HTMLInputElement.prototype.click = function(){
+  if (this.type === 'file') {
+    var dt = new DataTransfer(); dt.items.add(window.__f);
+    this.files = dt.files;
+    this.dispatchEvent(new Event('input',{bubbles:true}));
+    this.dispatchEvent(new Event('change',{bubbles:true}));
+    return;
+  }
+  return window.__orig.apply(this, arguments);
+};
+```
+
+Then click the page's upload button normally. Build `bytes` from a base64 string passed
+in the eval, since the page cannot read your filesystem.
+
+Drag-and-drop injection is the fallback for pages that never create an input, such as
+Google Drive's main grid. Dispatch `dragenter`, `dragover`, `drop` with a `DataTransfer`
+carrying the file. Two traps: the drop has to land on the overlay the page reveals after
+`dragover`, not on `[role=main]`, which on Drive is empty; and firing at several candidate
+targets uploads one copy per target.
+
+Never trust the page's own progress indicator. Google Drive's upload toast can sit at
+"Starting upload..." indefinitely after the file has already landed. Confirm in a separate
+tab.
 
 ## Artifacts
 
