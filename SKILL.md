@@ -264,10 +264,13 @@ browser closes. What it survives depends on scope:
   sessions. Run it after a human has logged in and the task is done:
   `pw end` first (promote refuses to copy a live profile, which would corrupt
   the cookie database), then `pw promote`.
-- Leave the browser open about a minute after a login before running `pw end`.
-  Chromium flushes cookies to disk on a roughly 30 second timer and Playwright
-  kills the browser on teardown, so closing immediately after logging in loses
-  the login. `pw promote` warns when it copies a profile with no stored cookies.
+- You no longer need to wait after a login before `pw end`. Chromium flushes
+  cookies to disk on a roughly 30 second timer and Playwright kills the browser
+  on teardown, so closing right after logging in used to lose the login. `pw`
+  now captures a storage-state snapshot from the live session before every
+  close and carries it through promote and seeding, so the login survives
+  regardless of that timer. `pw promote` still warns if it finds neither
+  stored cookies nor a snapshot.
 
 So the cost is a login per new session that needs one, dropping to zero for
 sites already captured in the golden profile. It is never a login per command.
