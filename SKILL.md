@@ -20,6 +20,101 @@ the mode, the artifact location, the persistent profile, and the session name
 for you. If `pw` is not on PATH, call it at
 `~/.claude/skills/use-browser/bin/pw`.
 
+## Cost discipline: never snapshot a page you can read another way
+
+A full `pw snapshot` costs 12,000 to 145,000 tokens. Measured on this machine:
+one Wikipedia snapshot is 135,872 tokens, about 68% of a 200k context window. A
+four-command task (open, snapshot, click, snapshot) measured 160,905 tokens, of
+which 160,684 were the two snapshots. The same task done with the verbs below
+cost 294 tokens. Treat `pw snapshot` with no arguments as a last resort.
+
+The browser is never the slow part: no verb exceeds 4.5 seconds and `snapshot`
+is the fastest of them. What costs you is tokens and round trips, so the goal is
+fewer calls returning less, not faster calls.
+
+In order of preference:
+
+1. **Collapse a known flow into one `pw run-code`.** It takes an async function
+   with the full Playwright `page` API and returns JSON. One call can navigate,
+   fill, click, wait and extract. Measured: 6 calls and 8,864 tokens became 1
+   call and 105 tokens.
+
+   ```bash
+   pw run-code 'async page => {
+     await page.goto("https://news.ycombinator.com/");
+     return await page.locator(".titleline > a").evaluateAll(
+       els => els.slice(0,5).map(e => ({t: e.textContent, h: e.href})));
+   }'
+   ```
+
+   `expect` is NOT in scope inside `run-code`. Wait with `locator.waitFor()`,
+   `page.waitForURL()`, `page.waitForResponse()`, `page.waitForFunction()`. A
+   `run-code` that throws loses all its work, so use it for pages you already
+   understand, not for exploring. Multi-line shell quoting is the practical
+   hazard; `--filename=script.js` avoids it.
+
+2. **Find the one element you need, do not snapshot the page to look for it.**
+   `pw find "<text>"` returns only matching nodes with surrounding context and
+   working refs. Measured on a GitHub pull request: `snapshot` 75,738 bytes,
+   `find "Files changed"` 791 bytes, and the ref it returned clicked correctly.
+   `find` builds the full tree internally, so it saves tokens, not time.
+
+3. **Read the file link an action already gave you.** `pw open` and `pw click`
+   return about 120 tokens: the page URL, the title, and a link to a file
+   holding the complete ref-annotated tree. Do not call `pw snapshot` afterwards
+   for a copy of what you already have. Grep that file instead.
+
+4. **Orient with `--depth` before drilling.** `pw snapshot --depth 5` cuts output
+   96 to 98%. On Wikipedia: `--depth 3` 833 bytes, `--depth 5` 6,805 bytes, full
+   138 KB. Use it to learn a page's shape, then `find` the part you want.
+
+5. **Read content with `eval`, never with a snapshot.** Wikipedia: full snapshot
+   138,038 bytes, the equivalent `eval` 168 bytes. Make extraction
+   self-checking: return the data plus a two-row sample plus a count, and throw
+   when the shape check fails, because a wrong column index returns plausible
+   garbage silently.
+
+6. **Read the JSON a console renders from.** Most SaaS dashboards fetch their
+   data. `pw requests --filter "/api/"` then `pw --raw response-body <n>`, or
+   `page.waitForResponse(...)` raced against the click inside `run-code`. Same
+   token cost as scraping the DOM, but it skips pagination, virtual scrolling
+   and truncated cells, and values arrive typed. The index is the global request
+   number, not the filtered position. `requests` clears on page load, so capture
+   before navigating away, and be aware session tokens can appear in
+   `request-headers` output.
+
+7. **Chain calls with `&&` in one Bash call.** The unit of cost is the tool
+   call, not the process. Past three or four steps, prefer one `run-code`,
+   because process startup adds up (2,676 ms across 6 processes against 874 ms
+   for one `run-code`).
+
+### Target by role locator, not by ref, when chaining
+
+Refs die on the navigation a click causes, so a chained command cannot reuse one.
+Every action verb accepts a locator instead:
+
+```bash
+pw click "getByRole('button', { name: 'Sign in' })"
+```
+
+`pw generate-locator <ref>` promotes a ref you already have into a durable
+locator. Role locators break under localisation where CSS survives, and the
+reverse; duplicate accessible names cause strict-mode violations.
+
+### Ref lifetime
+
+Refs are stable identities within one page, not positions: inserting rows does
+not renumber existing refs. Two things invalidate them.
+
+- Navigating. The `fN` prefix is the document generation.
+- A PARTIAL snapshot that excludes the element. `pw snapshot --depth 5` and
+  `pw snapshot <selector>` register only what they print, so refs seen before
+  them stop resolving.
+
+`find` does not do this: it builds a full-page snapshot internally and registers
+every ref before filtering the output. So `find` is both safe to use mid-task and
+the repair when a scoped snapshot has invalidated a ref you still need.
+
 ## Session discipline: one browser per agent session
 
 Each concurrent agent session gets its own browser and its own on-disk profile,
@@ -132,20 +227,28 @@ modes when needed:
 
 Both keep logins and the current page; the relaunch takes a few seconds.
 
-## After the human confirms login — snapshot before you navigate
+## After the human confirms login — check where you are before you navigate
 
 When a human says "logged in" or "done" after completing an auth flow:
 
-1. Run `pw snapshot` ONLY. Do not navigate anywhere yet.
-2. A site finishes an auth flow with redirects and token exchanges of its own.
-   Navigating on top of an unfinished one aborts it and drops you back at the
-   login page, so let the snapshot tell you where you actually are.
-3. Once the snapshot confirms you are past the auth wall, go wherever you need
-   with `pw open <url>`. It navigates the browser you already have and keeps the
-   login (see Session discipline).
-4. If the snapshot still shows a login page, tell the human and wait again.
+1. Check where you actually landed. Do not navigate anywhere yet. A site
+   finishes an auth flow with redirects and token exchanges of its own, and
+   navigating on top of an unfinished one aborts it and drops you back at the
+   login page.
+2. Check cheaply, not with a full snapshot:
 
-Burn it in: **after login confirmed → `pw snapshot` first, navigate second.**
+   ```bash
+   pw --raw eval "document.title + ' | ' + location.href"
+   ```
+
+   The URL and title answer this on their own most of the time. If the URL is
+   ambiguous, `pw find "Sign in"` tells you whether a login control is still on
+   the page, for a few hundred bytes.
+3. Once you are past the auth wall, go where you need with `pw open <url>`. It
+   navigates the browser you already have and keeps the login.
+4. If you are still on a login page, tell the human and wait again.
+
+Burn it in: **after login confirmed → check the URL first, navigate second.**
 
 ## How long a login lasts
 
@@ -202,11 +305,13 @@ happen, `pw promote` afterwards spares every future session the same prompt.
   plain `pw open <url>`, which reuses the browser you already have;
 - call `pw end` in the middle of a task;
 - run `pw promote` before the browser is closed, or seconds after a login;
-- **navigate anywhere the moment the human says they logged in** — snapshot
-  first, then go;
-- proceed after a snapshot shows "Sign in", "Log in", "Enter password",
-  "Verify", "two-factor", "authenticator", or an Okta / SSO / Microsoft /
-  Google login screen;
+- **navigate anywhere the moment the human says they logged in** — check the
+  URL first, then go;
+- take a full `pw snapshot` when `find`, `--depth`, `eval` or the file link an
+  action already returned would answer the question (see Cost discipline);
+- proceed when the page shows "Sign in", "Log in", "Enter password", "Verify",
+  "two-factor", "authenticator", or an Okta / SSO / Microsoft / Google login
+  screen;
 - type a password or 2FA code yourself (unless the human explicitly asked you to);
 - report success or "extracted data" from a page that was actually an auth wall.
 
@@ -264,13 +369,22 @@ nothing, prefix with `PW_EPHEMERAL=1`.
 ## Common commands
 
 ```bash
+# cheap first — see Cost discipline
+pw run-code 'async page => { ... }'   # whole flow in ONE call, returns JSON
+pw find "Files changed"         # just the matching nodes + refs (not the page)
+pw --raw eval "document.title"  # read content without a snapshot
+pw snapshot --depth 5           # orient: page shape, ~2-4% of a full snapshot
+pw requests --filter "/api/"    # the JSON the page renders from
+pw --raw response-body 2        # ...and its body
+pw generate-locator e42         # promote a ref to a durable role locator
+
 pw open https://example.com     # open (or reuse) the browser and navigate — any cwd
-pw snapshot                     # structured page snapshot with element refs
-pw click e15                    # act on a ref from the snapshot
+pw click e15                    # act on a ref from find/snapshot
+pw click "getByRole('button', { name: 'Sign in' })"   # or a locator, survives nav
 pw fill e5 "user@example.com" --submit
 pw type "search text"
-pw screenshot --filename=shot.png
-pw eval "document.title"
+pw screenshot --filename=shot.png     # to SHOW the human, not to find elements
+pw snapshot                     # LAST RESORT: 12k-145k tokens
 pw --raw eval "JSON.stringify(...)"   # clean output for piping
 pw hide                         # tuck the browser away (headless background work)
 pw show                         # bring the window back
@@ -285,6 +399,12 @@ pw nuke                         # reset THIS session (--all resets every session
 ```
 
 Full command surface: `pw --help` (it appends `playwright-cli --help`).
+
+`find`, `generate-locator`, `recording-start` and `recording-stop` need
+`@playwright/cli` 0.1.16 or newer. If `find` reports an unknown command, the
+installed engine is too old: tell the human to run
+`npm i -g @playwright/cli@latest`, and fall back to `pw snapshot --depth 8` plus
+`grep` on the snapshot file in the meantime.
 
 ## pw eval — JS syntax rules
 
@@ -310,15 +430,23 @@ pw --raw eval "JSON.stringify([...document.querySelectorAll('a')].map(function(a
 pw --raw eval "JSON.stringify([...document.querySelectorAll('a')].map(a => ({text: a.innerText, href: a.href})), null, 2)"
 ```
 
-## Clicking elements — use refs, not text
+## Clicking elements — find the ref, do not snapshot for it
 
-When `pw click "some text"` fails with "does not match any elements", the element is likely in a shadow DOM or uses a non-standard role. The reliable workflow:
+When `pw click "some text"` fails with "does not match any elements", the element
+is likely in a shadow DOM or uses a non-standard role. In order:
 
-1. Take `pw screenshot --filename=shot.png` and read `${TMPDIR:-/tmp}/pw-cli/shot.png` to visually locate the element.
-2. Take `pw snapshot` to get element refs (e.g. `e42`).
-3. Use `pw click e42` with the ref, or use `pw --raw eval` with a DOM query to `.click()` it directly.
+1. `pw find "some text"` — returns the matching nodes with working refs for a few
+   hundred bytes. This is almost always enough.
+2. If `find` returns nothing, try a role locator:
+   `pw click "getByRole('button', { name: 'Some Text' })"`.
+3. If you still cannot locate it, `pw snapshot --depth 8` to see the page's shape
+   and narrow down, then `find` again within that region's wording.
+4. Only as a last resort: `pw --raw eval` with a DOM query to `.click()` it.
 
-Do not retry `pw click "text"` with slight text variations — fall back to ref or eval click immediately.
+Do not retry `pw click "text"` with slight text variations. Do not take a
+screenshot to look for an element; it costs about 1,850 image tokens and `find`
+answers the same question for a fraction of that. Screenshots are for showing the
+human what a page looks like, not for locating elements.
 
 ## Uploading a file when `upload` is refused
 
