@@ -396,6 +396,95 @@ if [[ -d "$FORGET_CACHE/golden" ]]; then
   echo "FAIL: forget --golden left the golden profile"; FAIL=$((FAIL+1))
 else echo "ok: forget --golden removes the golden profile"; PASS=$((PASS+1)); fi
 
+# --- storage-state snapshot: promote must not depend on Chromium's flush timer
+# Chromium batches cookie writes on a ~30s timer and Playwright hard-kills the
+# browser on teardown, so a login completed seconds before `pw end` never
+# reaches the on-disk cookie store and promote copies a profile with no login.
+# state-save reads the LIVE session over the daemon's own connection, so it does
+# not depend on that timer. Capture before every close, carry the snapshot into
+# golden, apply it once on a freshly seeded session.
+
+SS_CACHE="$(mktemp -d)"
+ss_run() {  # ss_run <session-id-32hex> <args...>
+  local sid="$1"; shift
+  REC="$(mktemp)"
+  env -u PW_PROFILE_DIR -u PW_SESSION PATH="$STUB_DIR:$PATH" STUB_RECORD="$REC" \
+    CLAUDE_CODE_SESSION_ID="$sid" \
+    PW_CACHE_DIR="$SS_CACHE" PW_SCRATCH_DIR="$(mktemp -d)" \
+    "$PW" "$@" >/tmp/pw_out 2>/tmp/pw_err
+  RC=$?
+}
+SS_ID='dddddddd-1111-2222-3333-444444444444'
+SS_PROF="$SS_CACHE/sessions/dddddddd1111/profile"
+SNAP_REL=".pw-storage-state.json"
+
+mkdir -p "$SS_PROF/Default"; touch "$SS_PROF/Default/Cookies"
+ss_run "$SS_ID" end
+assert_contains "$REC" "state-save" "end captures storage state before closing"
+if grep -n "state-save" "$REC" | head -1 | cut -d: -f1 | {
+     read -r save; grep -n " close" "$REC" | head -1 | cut -d: -f1 | {
+       read -r close; [[ -n "$save" && -n "$close" && "$save" -lt "$close" ]]; }; }; then
+  echo "ok: capture happens BEFORE the close (state-save needs a live session)"; PASS=$((PASS+1))
+else echo "FAIL: state-save did not precede close"; FAIL=$((FAIL+1)); fi
+
+# A browser that will not close is worse than a missing snapshot, so a failing
+# capture must never fail the verb.
+ss_run "$SS_ID" end
+assert_rc 0 "end still succeeds when capture is best-effort"
+
+# Ephemeral keeps no profile, so there is nowhere to put a snapshot.
+REC="$(mktemp)"
+env -u PW_PROFILE_DIR -u PW_SESSION PATH="$STUB_DIR:$PATH" STUB_RECORD="$REC" \
+  CLAUDE_CODE_SESSION_ID="$SS_ID" PW_EPHEMERAL=1 \
+  PW_CACHE_DIR="$SS_CACHE" PW_SCRATCH_DIR="$(mktemp -d)" \
+  "$PW" end >/dev/null 2>&1
+assert_not_contains "$REC" "state-save" "ephemeral end captures no storage state"
+
+# forget deliberately discards this session's state, so capturing would write a
+# snapshot moments before deleting the directory holding it.
+ss_run "$SS_ID" forget
+assert_not_contains "$REC" "state-save" "forget captures nothing, it is discarding state"
+
+# promote carries the snapshot into golden. It rides inside the profile dir, so
+# a promote can never leave a golden whose snapshot and profile disagree.
+rm -rf "$SS_CACHE/golden" "$SS_CACHE/sessions/dddddddd1111/no-seed"
+mkdir -p "$SS_PROF/Default"; touch "$SS_PROF/Default/Cookies"
+printf '{"cookies":[{"name":"sid"}]}' > "$SS_PROF/$SNAP_REL"
+ss_run "$SS_ID" promote
+if [[ -f "$SS_CACHE/golden/$SNAP_REL" ]]; then
+  echo "ok: promote carries the storage-state snapshot into golden"; PASS=$((PASS+1))
+else echo "FAIL: promote left the snapshot behind"; FAIL=$((FAIL+1)); fi
+
+# The no-cookies warning is about a lost login. A snapshot holding one means the
+# login is not lost, so the warning would be false.
+assert_not_contains /tmp/pw_err "no stored cookies" "no false cookie warning when a snapshot carries the login"
+
+# Seeding a new session carries the snapshot in and marks it pending.
+SS_ID2='eeeeeeee-1111-2222-3333-444444444444'
+ss_run "$SS_ID2" open http://seeded
+SS_PROF2="$SS_CACHE/sessions/eeeeeeee1111/profile"
+if [[ -f "$SS_PROF2/$SNAP_REL" ]]; then
+  echo "ok: seeding carries the snapshot into the new session"; PASS=$((PASS+1))
+else echo "FAIL: seeding dropped the snapshot"; FAIL=$((FAIL+1)); fi
+assert_contains "$REC" "state-load" "first open of a seeded session applies the snapshot"
+
+# Applying must be idempotent: a stale snapshot overwriting cookies the session
+# has since changed is a regression, so the marker is cleared after one apply.
+ss_run "$SS_ID2" open http://again
+assert_not_contains "$REC" "state-load" "second open does not re-apply the snapshot"
+
+# A session that opted out of seeding must not receive a snapshot through this
+# new path either.
+SS_ID3='ffffffff-1111-2222-3333-444444444444'
+REC="$(mktemp)"
+env -u PW_PROFILE_DIR -u PW_SESSION PATH="$STUB_DIR:$PATH" STUB_RECORD="$REC" \
+  CLAUDE_CODE_SESSION_ID="$SS_ID3" PW_SEED=0 \
+  PW_CACHE_DIR="$SS_CACHE" PW_SCRATCH_DIR="$(mktemp -d)" \
+  "$PW" open http://noseed >/dev/null 2>&1
+if [[ -f "$SS_CACHE/sessions/ffffffff1111/profile/$SNAP_REL" ]]; then
+  echo "FAIL: PW_SEED=0 session received a snapshot"; FAIL=$((FAIL+1))
+else echo "ok: PW_SEED=0 receives no snapshot"; PASS=$((PASS+1)); fi
+
 # status must name the session it is reporting on — `playwright-cli list` is
 # global and shows other agents' sessions in the same output.
 env -u PW_PROFILE_DIR -u PW_SESSION PATH="$STUB_DIR:$PATH" \

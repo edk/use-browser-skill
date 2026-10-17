@@ -299,10 +299,56 @@ seed_profile_from_golden() {
   fi
   rm -rf "$PW_PROFILE_DIR" 2>/dev/null || true
   if mv "$staging" "$PW_PROFILE_DIR" 2>/dev/null; then
+    # The snapshot rode in inside the copied directory. Mark it pending so the
+    # first successful launch loads it, and only the first.
+    if [[ -f "$PW_PROFILE_DIR/$PW_SNAPSHOT_REL" ]]; then
+      mkdir -p "$PW_STATE_DIR" 2>/dev/null || true
+      : > "$PW_STATE_DIR/state-pending" 2>/dev/null || true
+    fi
     echo "pw: seeded this session's profile from $PW_GOLDEN_DIR (saved logins carried over)." >&2
   else
     rm -rf "$staging" 2>/dev/null || true
   fi
+  return 0
+}
+
+# Where the live storage-state snapshot lives. It sits INSIDE the profile dir on
+# purpose: promote and seed already copy that directory atomically, so the
+# snapshot and the profile can never disagree about which run they came from.
+PW_SNAPSHOT_REL=".pw-storage-state.json"
+
+# Capture the live cookies+localStorage before a close.
+#
+# Chromium batches cookie writes on a ~30s timer and Playwright hard-kills the
+# browser on teardown rather than closing the context, so a login completed
+# seconds before `pw end` never reaches the on-disk store and promote copies a
+# profile with no login. `state-save` is a run RPC to the daemon, the one
+# process holding the live context, so it reads what is in memory now and does
+# not depend on that timer.
+#
+# Best-effort by design: a browser that will not close is a worse outcome than a
+# missing snapshot, so every failure is swallowed and no caller may branch on
+# the result. Must run BEFORE the close, since state-save needs a live session.
+capture_storage_state() {
+  [[ "$PW_EPHEMERAL" == "1" ]] && return 0
+  [[ -d "$PW_PROFILE_DIR" ]] || return 0
+  "$PW_BIN" -s="$PW_SESSION" state-save "$PW_PROFILE_DIR/$PW_SNAPSHOT_REL" >/dev/null 2>&1 || true
+  # Plaintext cookies: tighten the moment it exists, whatever mode was used.
+  chmod 600 "$PW_PROFILE_DIR/$PW_SNAPSHOT_REL" 2>/dev/null || true
+  return 0
+}
+
+# Load a snapshot carried in from the golden profile, once, into a session that
+# was just seeded. Best-effort in the same sense: a session that starts logged
+# out is recoverable, one that will not start is not. The marker is cleared
+# whether or not the load succeeds, so a broken snapshot cannot wedge every
+# future launch into repeating the same failure.
+apply_pending_storage_state() {
+  local marker="$PW_STATE_DIR/state-pending"
+  [[ -f "$marker" ]] || return 0
+  rm -f "$marker" 2>/dev/null || true
+  [[ -f "$PW_PROFILE_DIR/$PW_SNAPSHOT_REL" ]] || return 0
+  "$PW_BIN" -s="$PW_SESSION" state-load "$PW_PROFILE_DIR/$PW_SNAPSHOT_REL" >/dev/null 2>&1 || true
   return 0
 }
 
@@ -443,6 +489,7 @@ sweep_stale_sessions() {
 relaunch_with_mode() {
   local want_headless="$1" url=""
   if session_running; then
+    capture_storage_state
     url="$("$PW_BIN" -s="$PW_SESSION" --raw eval 'location.href' 2>/dev/null | head -1 || true)"
     url="${url%\"}"; url="${url#\"}"
     "$PW_BIN" -s="$PW_SESSION" close >/dev/null 2>&1 || true
@@ -626,7 +673,11 @@ EOF
     # the browser on teardown, so a login completed seconds before 'pw end' can
     # still be in memory only and never reach disk. Promoting then copies a
     # profile with no cookies — silently useless. Say so instead.
-    if ! python3 - "$PW_GOLDEN_DIR/Default/Cookies" <<'PYEOF'
+    # A snapshot carrying the login means the login is NOT lost, so the warning
+    # below would be false. Skip it in that case.
+    if [[ -s "$PW_GOLDEN_DIR/$PW_SNAPSHOT_REL" ]]; then
+      :
+    elif ! python3 - "$PW_GOLDEN_DIR/Default/Cookies" <<'PYEOF'
 import sqlite3, sys, os, shutil, tempfile
 src = sys.argv[1]
 if not os.path.exists(src):
@@ -646,6 +697,7 @@ PYEOF
     fi
     ;;
   end)
+    capture_storage_state
     "$PW_BIN" -s="$PW_SESSION" close 2>/dev/null || true
     kill_profile_browsers
     if [[ "$PW_EPHEMERAL" == "1" ]]; then
@@ -656,6 +708,7 @@ PYEOF
     ;;
   fresh)
     shift
+    capture_storage_state
     "$PW_BIN" -s="$PW_SESSION" close >/dev/null 2>&1 || true
     kill_profile_browsers
     profile_launch_args
@@ -693,6 +746,7 @@ PYEOF
       # Scoped by default. close-all/kill-all and wiping the shared scratch dir
       # are machine-wide and would take out other sessions' browsers and
       # artifacts, which is the failure mode this whole design exists to stop.
+      capture_storage_state
       "$PW_BIN" -s="$PW_SESSION" close >/dev/null 2>&1 || true
       kill_profile_browsers
       sweep_stale_sessions
@@ -793,6 +847,10 @@ PYEOF
       profile_launch_args
       clear_session_cache
       "$PW_BIN" -s="$PW_SESSION" open --browser "$PW_BROWSER" ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"} "$@" || { kill_profile_browsers; die "open failed — profile browsers killed, lock cleared. Re-run pw open."; }
+      # Only after a successful launch: state-load needs a live session, and a
+      # session that starts logged out is recoverable where one that will not
+      # start is not.
+      apply_pending_storage_state
       ;;
     esac
     ;;
