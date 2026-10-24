@@ -1,7 +1,6 @@
 ---
 name: use-browser
 description: Use when driving a web browser to get something done — navigating to a page, clicking, filling or submitting a form, taking a screenshot, scraping or extracting data from a page, logging into a site, or testing a web page. For agent-driven browser automation of any site. Not for shared interactive debugging of your own running app — that is cosession.
-allowed-tools: Bash(pw:*), Bash(pwx:*)
 ---
 
 # use-browser
